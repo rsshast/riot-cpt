@@ -39,6 +39,7 @@ using namespace parthenon::package::prelude;
 
 // add the name of a namespace that contains your new ProblemGenerator
 #define FOREACH_PROBLEM                                                                  \
+  PROBLEM(cpt_0d)                                                                        \
   PROBLEM(ei_relax)                                                                      \
   PROBLEM(gacc)                                                                          \
   PROBLEM(gaussian_conduction)                                                           \

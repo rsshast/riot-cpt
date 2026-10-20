@@ -13,6 +13,7 @@
 // This file was made in part with generative AI.
 
 // Local Includes
+#include "cpt/cpt.hpp"
 #include "diagnostics/diagnostics.hpp"
 #include "gravity/gravity.hpp"
 #include "hydro/hydro.hpp"
@@ -77,6 +78,8 @@ Packages_t RiotDriver::ProcessPackages(std::unique_ptr<ParameterInput> &pin) {
       pin->GetOrAddBoolean("physics", "mix", false, "Enable BHR RANS subgrid model");
   const bool do_tn =
       pin->GetOrAddBoolean("physics", "tn", false, "Enable thermonuclear burn");
+  const bool do_cpt = pin->GetOrAddBoolean(
+      "physics", "cpt", false, "Enable charged-particle transport");
   const bool do_scalars =
       pin->GetOrAddBoolean("physics", "scalars", false, "enable passive scalars");
   const bool fixed_fluid = pin->GetOrAddBoolean("physics", "fixed_fluid", false,
@@ -103,6 +106,7 @@ Packages_t RiotDriver::ProcessPackages(std::unique_ptr<ParameterInput> &pin) {
   if (do_strength) PARTHENON_REQUIRE(do_hydro, "Strength requires hydro.")
   if (do_mix) PARTHENON_REQUIRE(do_hydro, "Mix requires hydro.")
   if (do_tn) PARTHENON_REQUIRE(do_hydro, "TN requires hydro.")
+  if (do_cpt) PARTHENON_REQUIRE(do_hydro, "CPT requires hydro.")
   if (do_scalars) PARTHENON_REQUIRE(do_hydro, "Scalars currently require hydro.")
   if (fixed_fluid) PARTHENON_REQUIRE(do_hydro, "Fixed fluid config. requires hydro.")
   if (do_multigroup_diffusion)
@@ -120,12 +124,12 @@ Packages_t RiotDriver::ProcessPackages(std::unique_ptr<ParameterInput> &pin) {
   if (do_lasers) PARTHENON_REQUIRE(do_ionization, "Lasers requires ionization.");
   if (do_prescribed_sources)
     PARTHENON_REQUIRE(do_hydro, "Prescribed sources requires hydro.");
-
   // add options to params
   riot->AddParam("do_hydro", do_hydro);
   riot->AddParam("do_strength", do_strength);
   riot->AddParam("do_mix", do_mix);
   riot->AddParam("do_tn", do_tn);
+  riot->AddParam("do_cpt", do_cpt);
   riot->AddParam("do_scalars", do_scalars);
   riot->AddParam("do_levelsets", do_levelsets);
   riot->AddParam("do_lasers", do_lasers);
@@ -177,6 +181,7 @@ Packages_t RiotDriver::ProcessPackages(std::unique_ptr<ParameterInput> &pin) {
     packages.Add(mat_pkg);
     packages.Add(Hydro::Initialize(pin.get(), mat_pkg.get()));
   }
+  if (do_cpt) packages.Add(CPT::Initialize(pin.get()));
   if (do_strength)
     packages.Add(Strength::Initialize(pin.get(), packages.Get("materials").get()));
   if (do_mix) packages.Add(Mix::Initialize(pin.get()));

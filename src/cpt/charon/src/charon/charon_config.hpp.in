@@ -1,0 +1,27 @@
+//========================================================================================
+// (C) (or copyright) 2024. Triad National Security, LLC. All rights reserved.
+//
+// This program was produced under U.S. Government contract 89233218CNA000001 for Los
+// Alamos National Laboratory (LANL), which is operated by Triad National Security, LLC
+// for the U.S. Department of Energy/National Nuclear Security Administration. All rights
+// in the program are reserved by Triad National Security, LLC, and the U.S. Department
+// of Energy/National Nuclear Security Administration. The Government is granted for
+// itself and others acting on its behalf a nonexclusive, paid-up, irrevocable worldwide
+// license in this material to reproduce, prepare derivative works, distribute copies to
+// the public, perform publicly and display publicly, and to permit others to do so.
+//========================================================================================
+
+#ifndef CHARON_CHARON_CONFIG_HPP_
+#define CHARON_CHARON_CONFIG_HPP_
+
+// clang-format off
+
+#include "@CHARON_HOST_VARIABLE_HEADER@"
+
+#define HOST_DENSITY @CHARON_HOST_DENSITY_VARIABLE@
+#define HOST_TEMPERATURE @CHARON_HOST_TEMPERATURE_VARIABLE@
+#define HOST_ALPHA_SOURCE @CHARON_HOST_ALPHA_SOURCE_VARIABLE@
+
+// clang-format on
+
+#endif // CHARON_CHARON_CONFIG_HPP_

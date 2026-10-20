@@ -108,7 +108,8 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin,
   // TODO(JMM): Move Carbuncle correction into HLLC solver
   std::string solver = pin->GetOrAddString(
       "hydro", "riemann", "hllc",
-      std::vector<std::string>{"hllc", "chllc", "lhllc", "hll"}, "Riemann solver to use");
+      std::vector<std::string>{"hllc", "hllcf", "chllc", "lhllc", "hll"},
+      "Riemann solver to use");
   if (solver == "hllc") {
     params.Add("riemann_solver", RiemannSolver::hllc);
   } else if (solver == "hllcf") {
@@ -688,10 +689,11 @@ Real EstimateTimestepMesh(MeshData<Real> *md) {
   auto &pkg = pm->packages.Get("hydro");
   auto &params = pkg->AllParams();
 
-  // If the fluid is fixed, hydro imposes no timestep constraints. We set the
-  // hydro timestep vote to a large value, but a slightly smaller one than
-  // the default value of parthenon/time/dt_max
-  const bool fixed_fluid = pm->packages.Get("riot")->Param<bool>("fixed_fluid");
+  // If the fluid update is fixed, hydro imposes no timestep constraints.
+  // We set the hydro timestep vote to a large value, but a slightly smaller one
+  // than the default value of parthenon/time/dt_max.
+  const auto &riot_pkg = pm->packages.Get("riot");
+  const bool fixed_fluid = riot_pkg->Param<bool>("fixed_fluid");
   if (fixed_fluid) return 1.e-3 * std::numeric_limits<Real>::max();
 
   // strength params

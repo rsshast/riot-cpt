@@ -187,7 +187,8 @@ void PostCommsFillDerived(MeshData<Real> *md) {
                      ccbulk::bulk_modulus, ccbulk::temperature,
                      ccbulk::electron_internal_energy, ccbulk::electron_temperature,
                      ccbulk::electron_pressure, ccbulk::electron_number_density,
-                     ccbulk::electron_bulk_modulus, ccbulk::electron_gruneisen_parameter>(
+                     ccbulk::electron_bulk_modulus,
+                     ccbulk::electron_gruneisen_parameter>(
           md);
 
   using lt = RiotUtils::LoopType<>;
@@ -334,6 +335,33 @@ void PostCommsFillDerived(MeshData<Real> *md) {
               pv(ccbulk::internal_energy(), kji) + 0.5 * rho_val * vsq;
         });
       });
+
+  // Own the source decision here, after the bulk state has been finalized.
+  // Replace the source on every fill; never accumulate histories across fills.
+  // CPT::HasCPTWork and Charon consume this field without a second temperature test.
+  if (riot->Param<bool>("do_cpt")) {
+    constexpr Real rho_burn = 100.0; // g / cm^3
+    constexpr Real histories_per_cell = 100.0;
+    const Real temperature_burn =
+        pm->packages.Get("charon")->Param<Real>("source_temperature_threshold");
+    auto vcpt = riot::MakePack<ccbulk::rho, ccbulk::temperature,
+                               ccbulk::cpt_alpha_source>(md);
+    auto cpt_idx_space =
+        lt::GetIndexSpace(IndexDomain::interior, 0, vcpt.GetNBlocks(), md,
+                          parthenon::TopologicalElement::CC);
+    RiotLoop::outer(
+        cpt_idx_space,
+        KOKKOS_LAMBDA(const lt::idx_range_t &idx_range, const int b) {
+          auto pv = RiotLoop::make_pack_view(idx_range, vcpt);
+          RiotLoop::inner(idx_range, [&](const auto kji) {
+            pv(ccbulk::cpt_alpha_source(), kji) =
+                (pv(ccbulk::rho(), kji) > rho_burn &&
+                 pv(ccbulk::temperature(), kji) > temperature_burn)
+                    ? histories_per_cell
+                    : 0.0;
+          });
+        });
+  }
 
   // Recompute electron pseudo-entropy from electron internal energy or pressure
   Ionization::ConvertElectronEnergyEntropyWork(

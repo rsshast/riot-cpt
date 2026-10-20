@@ -4,6 +4,8 @@ BIN/
 build*/
 generated/
 debug/
+analysis/
+riot_venv/
 
 # Visualization package files
 .smhist
@@ -55,6 +57,9 @@ inputs/bubble_source.dat
 
 # Ignore .rin input files (converted to .py)
 *.rin
+
+# Ignore submission scripts
+*.sh
 
 # Prompt-spectrum problem: generated opacity table + its generator and reference data
 inputs/radiation_transport/prompt/make_prompt_opacity_table.py

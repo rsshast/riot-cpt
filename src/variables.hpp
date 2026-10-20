@@ -126,6 +126,8 @@ VARIABLE_SCALAR(c.c, cell_delta, false);
 VARIABLE_SCALAR(c.c.bulk, laser_deposition, false);
 VARIABLE_SCALAR(c.c.bulk, laser_energy_density, false);
 VARIABLE_SCALAR(c.c.bulk, laser_tau_max, false);
+// Number of Monte Carlo alpha histories to source in this cell during a CPT step.
+VARIABLE_SCALAR(c.c.bulk, cpt_alpha_source, false);
 } // namespace bulk
 
 namespace mat {

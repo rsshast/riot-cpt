@@ -11,10 +11,13 @@
 #  the public, perform publicly and display publicly, and to permit others to do so.
 # ========================================================================================
 
-# This file was modified with the assistance of generative AI
+# This file was made in part with generative AI.
 
 set (SRC_LIST
   # alphabetical
+  
+  cpt/cpt.cpp
+  cpt/cpt.hpp
 
   diagnostics/diagnostics.cpp
   diagnostics/diagnostics.hpp
@@ -92,6 +95,7 @@ set (SRC_LIST
 
   riot_pgen/conduction_analytic.cpp
   riot_pgen/conduction_analytic.hpp
+  riot_pgen/cpt_0d.cpp
   riot_pgen/ei_relax.cpp
   riot_pgen/ei_relax.hpp
   riot_pgen/gacc.cpp
@@ -176,6 +180,21 @@ configure_file(
   ${CMAKE_CURRENT_BINARY_DIR}/generated/riot_limits.hpp
   @ONLY)
 
+# Configure Charon's host-variable interface for RIOT. Charon reads RIOT's bulk density
+# and temperature and consumes a neutral per-cell Monte Carlo source count. RIOT applies
+# deposition from Charon's tallies in cpt/cpt.cpp.
+set(CHARON_HOST_VARIABLE_HEADER "variables.hpp")
+set(CHARON_HOST_DENSITY_VARIABLE
+    "cell_variables::cell_averaged::bulk::rho")
+set(CHARON_HOST_TEMPERATURE_VARIABLE
+    "cell_variables::cell_averaged::bulk::temperature")
+set(CHARON_HOST_ALPHA_SOURCE_VARIABLE
+    "cell_variables::cell_averaged::bulk::cpt_alpha_source")
+
+add_subdirectory(cpt/charon)
+target_include_directories(lib_charon_package PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+
 add_library(riotlib ${SRC_LIST})
 
 # JMM: This is how to add kernel register usage diagnostics in amdclang
@@ -223,6 +242,7 @@ endif()
 target_link_libraries(riotlib PUBLIC
   $<IF:$<BOOL:${RIOT_BUILD_PARTHENON}>,parthenon,Parthenon::parthenon>
   $<IF:$<BOOL:${RIOT_BUILD_SINGULARITY}>,singularity-eos,singularity-eos::singularity-eos>
+  lib_charon_package
 )
 
 target_compile_options(riotlib

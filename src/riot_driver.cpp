@@ -29,6 +29,7 @@
 #include <solvers/solver_base.hpp>
 
 // Local Includes
+#include "cpt/cpt.hpp"
 #include "gravity/gravity.hpp"
 #include "hydro/hydro.hpp"
 #include "ionization/ionization.hpp"
@@ -83,6 +84,7 @@ RiotDriver::RiotDriver(ParameterInput *pin, ApplicationInput *app_in, Mesh *pm)
   do_strength = riot_pkg->Param<bool>("do_strength");
   do_mix = riot_pkg->Param<bool>("do_mix");
   do_tn = riot_pkg->Param<bool>("do_tn");
+  do_cpt = riot_pkg->Param<bool>("do_cpt");
   fixed_fluid = riot_pkg->Param<bool>("fixed_fluid");
   do_multigroup_diffusion = riot_pkg->Param<bool>("do_multigroup_diffusion");
   do_levelsets = riot_pkg->Param<bool>("do_levelsets");
@@ -153,6 +155,11 @@ TaskListStatus RiotDriver::Step() {
   auto status = RiotStepTasks().Execute();
   if (status != TaskListStatus::complete) return status;
 
+  if (do_cpt) {
+    status = CPT::Step(pmesh, tm, integrator->dt);
+    if (status != TaskListStatus::complete) return status;
+  }
+
   for (auto &fn : OperatorSplitTasks) {
     status = fn(pmesh, tm, integrator->dt).Execute();
     if (status != TaskListStatus::complete) return status;
@@ -167,16 +174,29 @@ TaskListStatus RiotDriver::Step() {
 //! \fn  TaskCollection RiotDriver::RiotStepTasks
 //! \brief
 TaskCollection RiotDriver::RiotStepTasks() {
+  using namespace ::parthenon::Update;
+
   TaskCollection tc;
-  // Return empty TaskCollection if hydro disabled
   if (!(do_hydro)) return tc;
 
   if (fixed_fluid && do_lasers)
     return Laser::LaserDepositionTasks(pmesh, integrator->dt);
-  else if (fixed_fluid)
+  else if (fixed_fluid) {
+    TaskID none(0);
+    const int num_partitions = pmesh->DefaultNumPartitions();
+    auto &region = tc.AddRegion(num_partitions);
+    for (int i = 0; i < num_partitions; ++i) {
+      auto &tl = region[i];
+      auto &base = pmesh->mesh_data.GetOrAdd("base", i);
+      auto *md = base.get();
+      auto interior = tl.AddTask(none, PreCommFillDerived<MeshData<Real>>, md);
+      auto boundaries =
+          parthenon::AddBoundaryExchangeTasks(interior, tl, base, pmesh->multilevel);
+      tl.AddTask(boundaries, FillDerived<MeshData<Real>>, md);
+    }
     return tc;
+  }
 
-  using namespace ::parthenon::Update;
   namespace mdname = container_names;
   TaskID none(0);
   const auto any = parthenon::BoundaryType::any;
