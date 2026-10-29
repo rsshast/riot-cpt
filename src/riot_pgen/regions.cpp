@@ -245,6 +245,8 @@ BlockInitData::BlockInitData(ParameterInput *pin)
               (kb[state].e - kb[state].s + 1);
   do_3t = pin->GetBoolean("physics", "ionization");
   if (do_3t) fully_ionized = pin->GetBoolean("ionization", "fully_ionized");
+  if (do_3t) fully_ionize_hydrogen =
+    pin->GetOrAddBoolean("ionization", "fully_ionize_hydrogen", false);
 }
 
 //----------------------------------------------------------------------------------------

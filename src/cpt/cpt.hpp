@@ -13,7 +13,8 @@
 namespace CPT {
 
 std::shared_ptr<parthenon::StateDescriptor>
-Initialize(parthenon::ParameterInput *pin);
+Initialize(parthenon::ParameterInput *pin,
+           parthenon::StateDescriptor *materials);
 
 parthenon::TaskListStatus Step(parthenon::Mesh *pm, parthenon::SimTime &tm,
                                const parthenon::Real dt);

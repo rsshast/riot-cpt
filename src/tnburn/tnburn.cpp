@@ -43,6 +43,13 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin,
   using parthenon::SparsePool;
   auto tnburn = std::make_shared<StateDescriptor>("TNBurn");
   Params &params = tnburn->AllParams();
+  // Source-only mode evaluates DT production in the CPT operator; no burn RHS.
+  params.Add("source_only", pin->GetOrAddBoolean("tnburn", "source_only", false));
+  if (params.Get<bool>("source_only")) {
+    PARTHENON_REQUIRE(pin->GetBoolean("physics", "cpt") &&
+                          pin->GetOrAddBoolean("charon", "tn_plasma", false),
+                      "TN source_only requires the tn_plasma CPT consumer");
+  }
 
   // NOTE(@pdmullen): TN burn is currently incompatible with sparse physics
   // TODO(@chadmeyer): Potentially address this and lift the PARTHENON_REQUIRE?
@@ -384,6 +391,7 @@ TaskStatus CalculateTNBurnSource(MeshData<Real> *state, MeshData<Real> *src,
   auto product_masses_per_mat_reaction =
       tnburn->Param<ParArray3D<Real>>("product_masses_per_mat_reaction");
   auto num_iso_per_mat = materials->Param<ParArray1D<int>>("num_iso_per_mat");
+  const bool source_only = tnburn->Param<bool>("source_only");
 
   // RHS variables; the inputs.  The reaction rates do not depend on much!
   auto v = riot::MakePack<ccbulk::temperature, ccmat::iso, ccmat::volume_fraction,
@@ -408,6 +416,8 @@ TaskStatus CalculateTNBurnSource(MeshData<Real> *state, MeshData<Real> *src,
           auto var = RiotLoop::make_var_view(idx_range, dv, r);
           RiotLoop::inner(idx_range, [&](const auto kji) { var(kji) = 0.0; });
         }
+
+        if (source_only) return; // RHS was zeroed above, including reaction counts.
 
         // Loop over all entries in ccmat::rho
         int offset_tnr = 0;

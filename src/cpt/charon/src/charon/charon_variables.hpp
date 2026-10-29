@@ -1,5 +1,5 @@
 //========================================================================================
-// (C) (or copyright) 2023-2025. Triad National Security, LLC. All rights reserved.
+// (C) (or copyright) 2023-2026. Triad National Security, LLC. All rights reserved.
 //
 // This program was produced under U.S. Government contract 89233218CNA000001 for Los
 // Alamos National Laboratory (LANL), which is operated by Triad National Security, LLC
@@ -58,6 +58,23 @@ CHARON_FIELD_VARIABLE(field.charon, residence_tally);
 CHARON_FIELD_VARIABLE(field.charon, spower_tally);
 CHARON_FIELD_VARIABLE(field.charon, spower_sum);
 CHARON_FIELD_VARIABLE(field.charon, spower_count);
+// TN
+CHARON_FIELD_VARIABLE(field.charon, plasma_velocity);
+CHARON_FIELD_VARIABLE(field.charon, plasma_electron_density);
+CHARON_FIELD_VARIABLE(field.charon, plasma_electron_temperature);
+CHARON_FIELD_VARIABLE(field.charon, plasma_ion_temperature);
+CHARON_FIELD_VARIABLE(field.charon, plasma_screening);
+CHARON_FIELD_VARIABLE(field.charon, plasma_ion_density);
+CHARON_FIELD_VARIABLE(field.charon, plasma_ion_charge);
+CHARON_FIELD_VARIABLE(field.charon, pending_alphas);
+CHARON_FIELD_VARIABLE(field.charon, physical_alphas);
+CHARON_FIELD_VARIABLE(field.charon, sampled_alphas);
+CHARON_FIELD_VARIABLE(field.charon, electron_heat_step);
+CHARON_FIELD_VARIABLE(field.charon, ion_heat_step);
+CHARON_FIELD_VARIABLE(field.charon, electron_heat);
+CHARON_FIELD_VARIABLE(field.charon, ion_heat);
+CHARON_FIELD_VARIABLE(field.charon, escaped_alphas);
+CHARON_FIELD_VARIABLE(field.charon, escaped_energy);
 
 namespace host {
 typedef HOST_DENSITY density;

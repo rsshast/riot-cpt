@@ -29,7 +29,7 @@ DOMAIN_RADIUS = 0.040
 FINAL_TIME = 2.0e-9
 TIMESTEP = 2.0e-12
 SOURCE_TEMPERATURE_THRESHOLD = 1.11e7
-#OUTPUT_DT = 1.0e-10
+OUTPUT_DT = 2.0e-11
 
 # FillInteriorDerived only sources CPT histories where rho > 100 g/cc and
 # T > 1.16045e7 K.  The uploaded 10 ns state is below that joint threshold.  A
@@ -37,7 +37,7 @@ SOURCE_TEMPERATURE_THRESHOLD = 1.11e7
 # but it is disabled by default because it drives an explosion rather than an implosion.
 SOURCE_SEED_RADIUS = 0.0
 SOURCE_SEED_DENSITY = 101.0
-SOURCE_SEED_TEMPERATURE = 1.18e7
+SOURCE_SEED_TEMPERATURE = 1.0e6
 
 # Initial outer-pusher state.  With the chosen IdealGas EOS this gives T=1.282e5 K.
 PUSHER_PRESSURE = 1.0e14
@@ -115,9 +115,9 @@ def build_parser():
     )
     parser.add_argument("--no-cpt", action="store_true",
                         help="Generate the hydro-only comparison deck")
-    parser.add_argument("--nx", type=_positive_int, default=96,
+    parser.add_argument("--nx", type=_positive_int, default=288,
                         help="Uniform cells in each Cartesian direction")
-    parser.add_argument("--meshblock-nx", type=_positive_int, default=16,
+    parser.add_argument("--meshblock-nx", type=_positive_int, default=36,
                         help="Cells per meshblock direction")
     parser.add_argument("--domain-radius", type=_positive_float, default=DOMAIN_RADIUS,
                         help="Cartesian half-width [cm]")
@@ -211,7 +211,7 @@ def make_input(args):
     riot.input("parthenon/output2", file_type="rst", dt=args.tlim)
     riot.input(
         "parthenon/time",
-        #nlim=1912,
+        #nlim=500,
         nlim=-1,
         tlim=args.tlim,
         integrator="rk1",

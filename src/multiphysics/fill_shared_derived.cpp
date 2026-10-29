@@ -339,7 +339,7 @@ void PostCommsFillDerived(MeshData<Real> *md) {
   // Own the source decision here, after the bulk state has been finalized.
   // Replace the source on every fill; never accumulate histories across fills.
   // CPT::HasCPTWork and Charon consume this field without a second temperature test.
-  if (riot->Param<bool>("do_cpt")) {
+  if (riot->Param<bool>("do_cpt") && !pm->packages.Get("charon")->Param<bool>("tn_plasma")) {
     constexpr Real rho_burn = 100.0; // g / cm^3
     constexpr Real histories_per_cell = 100.0;
     const Real temperature_burn =

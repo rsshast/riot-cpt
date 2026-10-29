@@ -181,7 +181,8 @@ Packages_t RiotDriver::ProcessPackages(std::unique_ptr<ParameterInput> &pin) {
     packages.Add(mat_pkg);
     packages.Add(Hydro::Initialize(pin.get(), mat_pkg.get()));
   }
-  if (do_cpt) packages.Add(CPT::Initialize(pin.get()));
+  //if (do_cpt) packages.Add(CPT::Initialize(pin.get()));
+  if (do_cpt) packages.Add(CPT::Initialize(pin.get(), packages.Get("materials").get()));
   if (do_strength)
     packages.Add(Strength::Initialize(pin.get(), packages.Get("materials").get()));
   if (do_mix) packages.Add(Mix::Initialize(pin.get()));

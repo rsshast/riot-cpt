@@ -667,6 +667,7 @@ class BlockInitData {
   int num_mask, num_state;
   parthenon::Coordinates_t *coords;
   bool do_3t, fully_ionized;
+  bool fully_ionize_hydrogen = false;
 
   inline auto coordinate_velocities(Real *v) {
     if constexpr (parthenon::IsCoord<parthenon::UniformCylindrical>()) {
@@ -724,6 +725,7 @@ class BlockInitData {
     Real rho, sie, sie_e, zbar;
     Real anuc = ion_eos.MeanAtomicMass();
     Real znuc = ion_eos.MeanAtomicNumber();
+    const bool fully_ionized = this->fully_ionized || (fully_ionize_hydrogen && znuc == 1.0);
     if (fully_ionized) {
       zbar = znuc;
     };

@@ -1,5 +1,5 @@
 //========================================================================================
-// (C) (or copyright) 2023-2025. Triad National Security, LLC. All rights reserved.
+// (C) (or copyright) 2023-2026. Triad National Security, LLC. All rights reserved.
 //
 // This program was produced under U.S. Government contract 89233218CNA000001 for Los
 // Alamos National Laboratory (LANL), which is operated by Triad National Security, LLC
@@ -39,13 +39,16 @@ using namespace units;
 //! \fn  TaskStatus SourceAlphas
 //! \brief Create alphas, either during initialization or during a timestep.
 //! TODO(BRR) modify interface so we don't need t_start, dt for initialization
-template <typename T, bool Diagnostics>
+template <typename T, bool Diagnostics, bool Plasma = false>
 TaskStatus SourceAlphasImpl(T *md, const Real t_start, const Real dt) {
   namespace fj = field::charon;
   namespace fjh = field::charon::host;
   namespace pa = particle::alphas; // Alpha particle name
 
   auto pm = md->GetParentPointer();
+  if constexpr (Plasma) {
+    if (dt <= 0.0) return TaskStatus::complete;
+  }
   auto &resolved_pkgs = pm->resolved_packages;
 //  auto &cpt_pkg = pm->packages.Get("charon");
   auto &cpt_pkg = md->GetParentPointer()->packages.Get("charon");
@@ -76,7 +79,14 @@ TaskStatus SourceAlphasImpl(T *md, const Real t_start, const Real dt) {
       cpt_pkg->template Param<Real>("fuel_density_threshold");
 
   auto desc = [&]() {
-    if constexpr (Diagnostics) {
+    if constexpr (Plasma && Diagnostics) {
+      return MakePackDescriptor<fj::source_num_per_cell, fj::source_ew_per_cell,
+                                fj::delta_num_per_cell, fjh::density,
+                                fjh::alpha_source, fj::plasma_velocity>(resolved_pkgs.get());
+    } else if constexpr (Plasma) {
+      return MakePackDescriptor<fjh::density, fjh::alpha_source,
+                                fj::plasma_velocity>(resolved_pkgs.get());
+    } else if constexpr (Diagnostics) {
       return MakePackDescriptor<fj::source_num_per_cell, fj::source_ew_per_cell,
                                 fj::delta_num_per_cell,
                                 fjh::density, fjh::alpha_source>(
@@ -490,7 +500,7 @@ TaskStatus SourceAlphasImpl(T *md, const Real t_start, const Real dt) {
                       "Fuel source did not find any cells above fuel_density_threshold.");
     // Verbose sourcing
     if (parthenon::Globals::my_rank == 0) {
-      std::cout << "[Charon Sourcing]"
+      std::cout << "[CHARon Sourcing]"
                 << " | Fuel source cells: " << fuel_source_cells
                 << " | fuel_density_threshold: " << fuel_density_threshold
                 << std::endl;
@@ -869,7 +879,7 @@ TaskStatus SourceAlphasImpl(T *md, const Real t_start, const Real dt) {
                                       updated_cumulative_alphas);
 
   if (parthenon::Globals::my_rank == 0 && step_total > 0) {
-    std::cout << "[Charon Sourcing]"
+    std::cout << "[CHARon Sourcing]"
               << " | Sourced this stage: " << step_total
               << " | Cumulative weighted alphas: " << updated_cumulative_alphas
               << " / " << alpha_source_physical_cap << std::endl;
@@ -1072,8 +1082,20 @@ TaskStatus SourceAlphasImpl(T *md, const Real t_start, const Real dt) {
           }
 #endif
           ppack_r(b, pa::energy(), n) = E0;// MeV
+          if constexpr (Plasma) {
+            Real lab_speed2 = 0.0;
+            for (int d = 0; d < 3; ++d) {
+              auto &velocity = ppack_r(b, pa::v(d), n);
+              velocity += vmesh(b, fj::plasma_velocity(d), k, j, i);
+              lab_speed2 += velocity * velocity;
+            }
+            // Swarm energy is lab kinetic energy; LP recomputes relative energy.
+            ppack_r(b, pa::energy(), n) = 0.5 * MALPHA * lab_speed2;
+          }
           ppack_r(b, pa::weight(), n) = a_ww;
-          if (use_host_line_source && current_cycle == 0) {
+          if constexpr (Plasma) {
+            ppack_r(b, pa::time(), n) = t_startd + rng_gen.drand() * dtd;
+          } else if (use_host_line_source && current_cycle == 0) {
             // sine_test defines its initial population as present at t=0.
             ppack_r(b, pa::time(), n) = t_startd;
           } else {
@@ -1095,6 +1117,10 @@ template <typename T>
 TaskStatus SourceAlphas(T *md, const Real t_start, const Real dt) {
   const bool diagnostics = md->GetParentPointer()->packages.Get("charon")
                                ->template Param<bool>("cpt_diagnostics");
+  if (md->GetParentPointer()->packages.Get("charon")->template Param<bool>("tn_plasma")) {
+    return diagnostics ? SourceAlphasImpl<T, true, true>(md, t_start, dt)
+                       : SourceAlphasImpl<T, false, true>(md, t_start, dt);
+  }
   return diagnostics ? SourceAlphasImpl<T, true>(md, t_start, dt)
                      : SourceAlphasImpl<T, false>(md, t_start, dt);
 }

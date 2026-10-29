@@ -5,6 +5,8 @@
 
 #include "cpt/cpt.hpp"
 
+#include <algorithm>
+#include <climits>
 #include <cmath>
 
 #include <parthenon_mpi.hpp>
@@ -13,12 +15,254 @@
 #include "transport_utils.hpp"
 #include "multiphysics/fill_shared_derived.hpp"
 #include "variables.hpp"
+#include "microphysics/eos_riot.hpp"
+#include "riot_utils/riot_utils.hpp"
+#include "tnburn/ratelib/tn_data_types.hpp"
 
 using namespace parthenon::driver::prelude;
 
 namespace CPT {
 
 namespace {
+
+// TN background, source-only production, and explicit plasma feedback.
+namespace fj = field::charon;
+namespace cb = cell_variables::cell_averaged::bulk;
+namespace cm = cell_variables::material_averaged;
+namespace mat = cell_variables::cell_averaged::mat;
+
+void InitializeTNPlasma(ParameterInput *pin, StateDescriptor *pkg,
+                        StateDescriptor *materials) {
+  if (!pkg->Param<bool>("tn_plasma")) return;
+  PARTHENON_REQUIRE(pkg->Param<std::string>("stopping_power_model") == "LiPetrasso" ||
+                        pkg->Param<std::string>("stopping_power_model") == "constant",
+                    "tn_plasma supports LiPetrasso or constant stopping");
+  PARTHENON_REQUIRE(pin->GetBoolean("physics", "tn") &&
+                        pin->GetBoolean("physics", "ionization"),
+                    "tn_plasma requires TN and ionization");
+  PARTHENON_REQUIRE(pin->GetOrAddBoolean("tnburn", "source_only", false),
+                    "tn_plasma currently requires tnburn/source_only=true");
+  PARTHENON_REQUIRE(
+      !pin->GetOrAddBoolean("ionization", "advect_electron_entropy", false),
+      "tn_plasma currently requires electron-energy advection, not entropy advection");
+  PARTHENON_REQUIRE(
+      !pkg->Param<bool>("do_population_control") &&
+          !pkg->Param<bool>("tally_mass_momentum") &&
+          pkg->Param<charon::SourceStrategy>("source_strategy") ==
+              charon::SourceStrategy::qfield &&
+          pkg->Param<std::string>("alpha_source_mode") == "total",
+      "tn_plasma requires qfield/total, no population or mass/momentum feedback");
+  PARTHENON_REQUIRE(pkg->Param<Real>("alpha_source_physical_cap") ==
+                        std::numeric_limits<Real>::max(),
+                    "TN source accounting requires no alpha_source_physical_cap");
+  const auto names = materials->Param<std::vector<std::vector<int>>>("Isotope Zaids");
+  const auto masses = materials->Param<std::vector<std::vector<Real>>>("Isotope Masses");
+  const auto charges = materials->Param<std::vector<std::vector<int>>>("Isotope Charges");
+  const auto eos = materials->Param<std::vector<RiotEOS::EOS>>("h.h.EOS");
+  const auto eos_map = materials->Param<std::vector<int>>("h.EOS_from_matid");
+  std::vector<int> starts, counts;
+  std::vector<Real> species_masses, species_charges;
+  for (int m = 0; m < names.size(); ++m) {
+    starts.push_back(species_masses.size());
+    counts.push_back(names[m].size());
+    if (names[m].empty()) {
+      species_masses.push_back(eos[eos_map[m]].MeanAtomicMass() * amu);
+      species_charges.push_back(eos[eos_map[m]].MeanAtomicNumber());
+    } else {
+      for (int s = 0; s < names[m].size(); ++s) {
+        PARTHENON_REQUIRE(masses[m][s] > 0.0 && charges[m][s] >= 0,
+                          "Invalid isotope metadata");
+        species_masses.push_back(masses[m][s] * amu);
+        species_charges.push_back(charges[m][s]);
+      }
+    }
+  }
+  pkg->AddParam("plasma_species_start",
+                RiotUtils::VectorToDevice(starts, "plasma species start"));
+  pkg->AddParam("plasma_material_isotopes",
+                RiotUtils::VectorToDevice(counts, "plasma isotope count"));
+  pkg->AddParam("plasma_species_mass",
+                RiotUtils::VectorToDevice(species_masses, "plasma species masses"));
+  pkg->AddParam("plasma_species_nuclear_charge",
+                RiotUtils::VectorToDevice(species_charges, "plasma nuclear charges"));
+  pkg->AddParam("plasma_num_species", static_cast<int>(species_masses.size()));
+  const std::string upper =
+      pin->GetOrAddString("charon", "tn_upper_temperature", "error");
+  PARTHENON_REQUIRE(upper == "error" || upper == "clamp",
+                    "tn_upper_temperature must be error or explicit clamp");
+  pkg->AddParam("tn_clamp_upper", upper == "clamp");
+  Metadata work({Metadata::Cell, Metadata::OneCopy});
+  Metadata persistent(
+      {Metadata::Cell, Metadata::OneCopy, Metadata::Restart, Metadata::ForceRemeshComm});
+  Metadata vector({Metadata::Cell, Metadata::OneCopy}, std::vector<int>{3});
+  Metadata ions({Metadata::Cell, Metadata::OneCopy},
+                std::vector<int>{static_cast<int>(species_masses.size())});
+  pkg->AddField(fj::plasma_velocity::name(), vector);
+  pkg->AddField(fj::plasma_ion_density::name(), ions);
+  pkg->AddField(fj::plasma_ion_charge::name(), ions);
+  for (auto name :
+       {fj::plasma_electron_density::name(), fj::plasma_electron_temperature::name(),
+        fj::plasma_ion_temperature::name(), fj::plasma_screening::name(),
+        fj::electron_heat_step::name(), fj::ion_heat_step::name()})
+    pkg->AddField(name, work);
+  // Extensive physical inventory per cell, persisted independently of output cadence.
+  for (auto name :
+       {fj::pending_alphas::name(), fj::physical_alphas::name(),
+        fj::sampled_alphas::name(), fj::electron_heat::name(), fj::ion_heat::name(),
+        fj::escaped_alphas::name(), fj::escaped_energy::name()})
+    pkg->AddField(name, persistent);
+}
+
+void PrepareTNPlasma(MeshData<Real> *md, Real dt) {
+  auto pm = md->GetMeshPointer();
+  const auto pkg = pm->packages.Get("charon");
+  const auto tn = pm->packages.Get("TNBurn");
+  const auto materials = pm->packages.Get("materials");
+  const auto starts = pkg->Param<ParArray1D<int>>("plasma_species_start");
+  const auto niso = pkg->Param<ParArray1D<int>>("plasma_material_isotopes");
+  const auto masses = pkg->Param<ParArray1D<Real>>("plasma_species_mass");
+  const auto charges = pkg->Param<ParArray1D<Real>>("plasma_species_nuclear_charge");
+  const int ns = pkg->Param<int>("plasma_num_species");
+  const Real weight = pkg->Param<Real>("alpha_weight");
+  PARTHENON_REQUIRE(std::isfinite(weight) && weight > 0, "Invalid physical alpha weight");
+  const bool clamp = pkg->Param<bool>("tn_clamp_upper");
+  const auto nreactions = tn->Param<ParArray1D<int>>("num_reactions_per_mat");
+  const auto reactions = tn->Param<ParArray2D<int>>("reaction_list_per_mat");
+  const auto reactants = tn->Param<ParArray3D<int>>("reactant_indices_per_mat_reaction");
+  const auto data = tn->Param<ParArray1D<ReactionData>>("reaction_data");
+  const auto nphase = materials->Param<ParArray1D<int>>("d.nphase");
+  const Real vfmin = pm->packages.Get("hydro")->Param<Real>("vol_frac_thresh");
+  auto v = riot::MakePack<
+      cb::temperature, cb::electron_temperature, cb::electron_number_density,
+      cb::velocity, cb::cpt_alpha_source, mat::rho, mat::iso, mat::volume_fraction,
+      cm::phase_fraction, cm::ionization_zbar, fj::plasma_velocity,
+      fj::plasma_electron_density, fj::plasma_electron_temperature,
+      fj::plasma_ion_temperature, fj::plasma_screening, fj::plasma_ion_density,
+      fj::plasma_ion_charge, fj::pending_alphas, fj::physical_alphas, fj::sampled_alphas,
+      fj::electron_heat_step, fj::ion_heat_step>(md);
+  if (v.GetNBlocks() == 0) return;
+  auto ib = md->GetBoundsI(IndexDomain::interior);
+  auto jb = md->GetBoundsJ(IndexDomain::interior);
+  auto kb = md->GetBoundsK(IndexDomain::interior);
+  parthenon::par_for(
+      parthenon::loop_pattern_mdrange_tag, "PrepareTNPlasma", DevExecSpace(), 0,
+      v.GetNBlocks() - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+      KOKKOS_LAMBDA(int b, int k, int j, int i) {
+        Real rho = 0;
+        for (int m = 0; m < v.GetSize(b, mat::rho()); ++m)
+          rho += v(b, mat::rho(m), k, j, i);
+        // Positive vacuum sentinels belong to this adapter, not RIOT's state.
+        const Real ti = rho > 0 ? v(b, cb::temperature(), k, j, i) : Real(1);
+        const Real te = rho > 0 ? v(b, cb::electron_temperature(), k, j, i) : Real(1);
+        const Real ne = v(b, cb::electron_number_density(), k, j, i);
+        PARTHENON_REQUIRE(std::isfinite(ti) && ti > 0 && std::isfinite(te) && te > 0 &&
+                              std::isfinite(ne) && ne >= 0,
+                          "Invalid RIOT plasma state");
+        v(b, fj::plasma_ion_temperature(), k, j, i) = ti;
+        v(b, fj::plasma_electron_temperature(), k, j, i) = te;
+        v(b, fj::plasma_electron_density(), k, j, i) = ne;
+        for (int d = 0; d < 3; ++d)
+          v(b, fj::plasma_velocity(d), k, j, i) =
+              rho > 0 ? v(b, cb::velocity(d), k, j, i) : Real(0);
+        for (int s = 0; s < ns; ++s) {
+          v(b, fj::plasma_ion_density(s), k, j, i) = 0;
+          v(b, fj::plasma_ion_charge(s), k, j, i) = 0;
+        }
+        Real rate = 0;
+        int iso_offset = 0;
+        for (int m = 0; m < v.GetSize(b, mat::rho()); ++m) {
+          const int id = v(b, mat::rho(m)).sparse_id;
+          // This adapter supports arbitrary sparse material IDs; multiphase chemistry
+          // requires an explicit stopping closure rather than duplicate isotope density.
+          PARTHENON_REQUIRE(nphase(id) == 1,
+                            "tn_plasma currently requires single-phase materials");
+          const int first = starts(id);
+          const Real zbar = v(b, cm::ionization_zbar(m), k, j, i);
+          if (niso(id) == 0) {
+            v(b, fj::plasma_ion_density(first), k, j, i) =
+                v(b, mat::rho(m), k, j, i) / masses(first);
+            v(b, fj::plasma_ion_charge(first), k, j, i) = zbar;
+          } else {
+            for (int s = 0; s < niso(id); ++s) {
+              v(b, fj::plasma_ion_density(first + s), k, j, i) =
+                  v(b, mat::iso(iso_offset + s), k, j, i) / masses(first + s);
+              // Explicit isotope populations in this mode are fully ionized fuel.
+              v(b, fj::plasma_ion_charge(first + s), k, j, i) = charges(first + s);
+            }
+            const Real vf = v(b, mat::volume_fraction(m), k, j, i);
+            for (int r = 0; r < nreactions(id); ++r) {
+              const auto rd = data(reactions(id, r));
+              PARTHENON_REQUIRE(
+                  rd.num_reactants == 2 &&
+                      ((rd.reactants[0] == 1002 && rd.reactants[1] == 1003) ||
+                       (rd.reactants[0] == 1003 && rd.reactants[1] == 1002)),
+                  "Source-only CPT supports DT only");
+              const Real lo =
+                  std::max(rd.Temperatures(0), Real(1.602176565e-9 / 1.3806488e-16));
+              const Real hi = rd.Temperatures(rd.num_temp - 1);
+              if (vf > vfmin && ti >= lo) {
+                PARTHENON_REQUIRE(clamp || ti <= hi,
+                                  "DT source above table maximum; extend table or "
+                                  "explicitly select clamp");
+                const Real sigma = rd.SigmaVBar.interpToReal(std::log(std::min(ti, hi)));
+                const Real phase = v(b, cm::phase_fraction(m), k, j, i);
+                rate += v(b, mat::iso(iso_offset + reactants(id, r, 0)), k, j, i) *
+                        v(b, mat::iso(iso_offset + reactants(id, r, 1)), k, j, i) *
+                        sigma * phase * phase / vf;
+              }
+            }
+          }
+          iso_offset += niso(id);
+        }
+        Real screening = charon::PlasmaStopping::Screening(ne, 1, te);
+        for (int s = 0; s < ns; ++s) {
+          const Real n = v(b, fj::plasma_ion_density(s), k, j, i);
+          const Real z = v(b, fj::plasma_ion_charge(s), k, j, i);
+          PARTHENON_REQUIRE(std::isfinite(n) && n >= 0 && std::isfinite(z) && z >= 0,
+                            "Invalid ion density/charge in plasma adapter");
+          screening += charon::PlasmaStopping::Screening(n, z, ti);
+        }
+        v(b, fj::plasma_screening(), k, j, i) = screening;
+        const Real produced = rate * v.GetCoordinates(b).CellVolume(k, j, i) * dt;
+        PARTHENON_REQUIRE(std::isfinite(produced) && produced >= 0,
+                          "Invalid physical alpha production");
+        auto &pending = v(b, fj::pending_alphas(), k, j, i);
+        const Real count = charon::SourceHistoryCount(produced, weight, pending);
+        const int ncells = (ib.e - ib.s + 1) * (jb.e - jb.s + 1) * (kb.e - kb.s + 1);
+        PARTHENON_REQUIRE(count < INT_MAX / ncells,
+                          "Too many histories per block: increase alpha_weight");
+        v(b, cb::cpt_alpha_source(), k, j, i) = count;
+        v(b, fj::physical_alphas(), k, j, i) += produced;
+        v(b, fj::sampled_alphas(), k, j, i) += count * weight;
+        v(b, fj::electron_heat_step(), k, j, i) = 0;
+        v(b, fj::ion_heat_step(), k, j, i) = 0;
+      });
+}
+
+TaskStatus ApplyPlasmaDeposition(MeshData<Real> *md) {
+  const auto pkg = md->GetMeshPointer()->packages.Get("charon");
+  auto v = riot::MakePack<cb::total_material_energy, cb::electron_internal_energy,
+                          fj::electron_heat_step, fj::ion_heat_step>(md);
+  if (v.GetNBlocks() == 0) return TaskStatus::complete;
+  auto ib = md->GetBoundsI(IndexDomain::interior);
+  auto jb = md->GetBoundsJ(IndexDomain::interior);
+  auto kb = md->GetBoundsK(IndexDomain::interior);
+  int changed = 0;
+  parthenon::par_reduce(
+      parthenon::loop_pattern_mdrange_tag, "ApplyPlasmaHeat", DevExecSpace(), 0,
+      v.GetNBlocks() - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+      KOKKOS_LAMBDA(int b, int k, int j, int i, int &n) {
+        const Real qe = v(b, fj::electron_heat_step(), k, j, i);
+        const Real qi = v(b, fj::ion_heat_step(), k, j, i);
+        const Real volume = v.GetCoordinates(b).CellVolume(k, j, i);
+        v(b, cb::total_material_energy(), k, j, i) += (qe + qi) / volume;
+        v(b, cb::electron_internal_energy(), k, j, i) += qe / volume;
+        if (qe + qi != 0) ++n;
+      },
+      Kokkos::Sum<int>(changed));
+  if (changed) *pkg->MutableParam<bool>("feedback_changed") = true;
+  return TaskStatus::complete;
+}
 
 bool HasCPTWork(Mesh *pm, const Real dt) {
   namespace ccbulk = cell_variables::cell_averaged::bulk;
@@ -190,7 +434,7 @@ TaskCollection DepositionTasks(Mesh *pm) {
 
 } // namespace
 
-std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
+std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin, StateDescriptor *materials) {
   namespace ccbulk = cell_variables::cell_averaged::bulk;
 
   // Keep the historical cutoff for existing decks that do not supply this knob.
@@ -226,11 +470,17 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   Metadata source_metadata(
       {Metadata::Cell, Metadata::Derived, Metadata::OneCopy});
   pkg->AddField<ccbulk::cpt_alpha_source>(source_metadata);
+  InitializeTNPlasma(pin, pkg.get(), materials);
   return pkg;
 }
 
 TaskListStatus Step(Mesh *pm, SimTime &tm, const Real dt) {
   auto &pkg = pm->packages.Get("charon");
+  if (pkg->Param<bool>("tn_plasma")) {
+    for (int p = 0; p < pm->DefaultNumPartitions(); ++p) {
+      PrepareTNPlasma(pm->mesh_data.GetOrAdd("base", p).get(), dt);
+    }
+  }
   if (!HasCPTWork(pm, dt)) {
     auto scratch = pkg->Param<std::shared_ptr<charon::TransportScratch>>(
         "transport_scratch");
@@ -256,7 +506,9 @@ TaskListStatus Step(Mesh *pm, SimTime &tm, const Real dt) {
   *pkg->MutableParam<bool>("feedback_changed") = false;
   for (int p = 0; p < pm->DefaultNumPartitions(); ++p) {
     auto *md = pm->mesh_data.GetOrAdd("base", p).get();
-    if (pkg->Param<bool>("compact_tallies")) {
+    if (pkg->Param<bool>("tn_plasma")) {
+      ApplyPlasmaDeposition(md);
+    } else if (pkg->Param<bool>("compact_tallies")) {
       ApplyDeposition<true>(md);
     } else {
       ApplyDeposition<false>(md);

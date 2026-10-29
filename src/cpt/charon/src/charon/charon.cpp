@@ -1,5 +1,5 @@
 //========================================================================================
-// (C) (or copyright) 2023-2025. Triad National Security, LLC. All rights reserved.
+// (C) (or copyright) 2023-2026. Triad National Security, LLC. All rights reserved.
 //
 // This program was produced under U.S. Government contract 89233218CNA000001 for Los
 // Alamos National Laboratory (LANL), which is operated by Triad National Security, LLC
@@ -19,6 +19,7 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <parthenon_mpi.hpp>
 
 // Charon includes
 #include "charon.hpp"
@@ -69,6 +70,66 @@ TaskStatus MeshReceive(MeshData<Real> *md) {
   return status;
 }
 namespace {
+
+void InitializePlasmaInventory(Mesh *pm, const SimTime &tm) {
+  namespace fj = field::charon;
+  const auto pkg = pm->packages.Get("charon");
+  if (!pkg->Param<bool>("tn_plasma")) return;
+  if (tm.ncycle != 0) {
+    // Parameters are reconstructed at startup; recover the logging counter from
+    // the restart-backed cell inventory rather than resetting it to zero.
+    Real sampled = 0;
+    for (int p = 0; p < pm->DefaultNumPartitions(); ++p) {
+      auto md = pm->mesh_data.GetOrAdd("base", p);
+      auto desc = MakePackDescriptor<fj::sampled_alphas>(pm->resolved_packages.get());
+      auto v = desc.GetPack(md.get());
+      if (v.GetNBlocks() == 0) continue;
+      auto ib = md->GetBoundsI(IndexDomain::interior);
+      auto jb = md->GetBoundsJ(IndexDomain::interior);
+      auto kb = md->GetBoundsK(IndexDomain::interior);
+      Real part = 0;
+      parthenon::par_reduce(
+          parthenon::loop_pattern_mdrange_tag, "RestoreSampledAlphaInventory",
+          DevExecSpace(), 0, v.GetNBlocks() - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+          KOKKOS_LAMBDA(int b, int k, int j, int i, Real &sum) {
+            sum += v(b, fj::sampled_alphas(), k, j, i);
+          },
+          Kokkos::Sum<Real>(part));
+      sampled += part;
+    }
+#ifdef MPI_PARALLEL
+    PARTHENON_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, &sampled, 1, MPI_PARTHENON_REAL,
+                                      MPI_SUM, MPI_COMM_WORLD));
+#endif
+    pkg->UpdateParam<Real>("cumulative_alphas_sourced", sampled);
+    return;
+  }
+  // Restarted cycles retain the extensive inventory, including fractional births.
+  for (int p = 0; p < pm->DefaultNumPartitions(); ++p) {
+    auto md = pm->mesh_data.GetOrAdd("base", p);
+    auto desc =
+        MakePackDescriptor<fj::pending_alphas, fj::physical_alphas, fj::sampled_alphas,
+                           fj::electron_heat, fj::ion_heat, fj::escaped_alphas,
+                           fj::escaped_energy>(pm->resolved_packages.get());
+    auto v = desc.GetPack(md.get());
+    auto ib = md->GetBoundsI(IndexDomain::interior);
+    auto jb = md->GetBoundsJ(IndexDomain::interior);
+    auto kb = md->GetBoundsK(IndexDomain::interior);
+    if (v.GetNBlocks() == 0) continue;
+    parthenon::par_for(
+        DEFAULT_LOOP_PATTERN, "InitializePlasmaInventory", DevExecSpace(), 0,
+        v.GetNBlocks() - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+        KOKKOS_LAMBDA(int b, int k, int j, int i) {
+          v(b, fj::pending_alphas(), k, j, i) = 0;
+          v(b, fj::physical_alphas(), k, j, i) = 0;
+          v(b, fj::sampled_alphas(), k, j, i) = 0;
+          v(b, fj::electron_heat(), k, j, i) = 0;
+          v(b, fj::ion_heat(), k, j, i) = 0;
+          v(b, fj::escaped_alphas(), k, j, i) = 0;
+          v(b, fj::escaped_energy(), k, j, i) = 0;
+        });
+  }
+}
 
 template <typename T>
 struct MinMeanMax {
@@ -260,6 +321,26 @@ std::shared_ptr<StateDescriptor>
 Initialize_impl(ParameterInput *pin, std::string block_name,
                 const bool allow_compact_tallies) {
   auto pkg = std::make_shared<StateDescriptor>("charon");
+  pkg->AddParam("tn_plasma", pin->GetOrAddBoolean(block_name, "tn_plasma", false));
+  if (pkg->Param<bool>("tn_plasma")) {
+    const Real cutoff = pin->GetOrAddReal(block_name, "thermalization_mev", 0.2);
+    const Real tolerance = pin->GetOrAddReal(block_name, "plasma_velocity_tolerance", 1.e-4);
+    const Real fraction = pin->GetOrAddReal(block_name, "plasma_fractional_step", 0.02);
+    const Real ion_fraction = pin->GetOrAddReal(block_name, "constant_ion_fraction", 0.5);
+    const int limit = pin->GetOrAddInteger(block_name, "plasma_max_substeps", 100000);
+    PARTHENON_REQUIRE(std::isfinite(cutoff) && cutoff > 0 && cutoff < 3.54 &&
+        std::isfinite(tolerance) && tolerance > 0 && tolerance < 1 &&
+        std::isfinite(fraction) && fraction > 0 && fraction <= 0.1 &&
+        ion_fraction >= 0 && ion_fraction <= 1 && limit > 0,
+        "Invalid plasma transport controls");
+    PARTHENON_REQUIRE(parthenon::IsCoord<parthenon::UniformCartesian>(),
+                      "TN plasma transport currently requires Cartesian coordinates");
+    pkg->AddParam("plasma_thermalization_energy", cutoff * units::MeV_to_ERG);
+    pkg->AddParam("plasma_velocity_tolerance", tolerance);
+    pkg->AddParam("plasma_fractional_step", fraction);
+    pkg->AddParam("plasma_max_substeps", limit);
+    pkg->AddParam("constant_ion_fraction", ion_fraction);
+  }
   const std::string default_stopping_power_model =
       pin->DoesParameterExist("charon", "stopping_power_model")
           ? pin->GetString("charon", "stopping_power_model")
@@ -341,7 +422,8 @@ Initialize_impl(ParameterInput *pin, std::string block_name,
   PARTHENON_REQUIRE(alpha_weight > 0.0, "alpha_weight must be positive");
   pkg->AddParam<>("alpha_weight", alpha_weight);
   const Real alpha_source_physical_cap = pin->GetOrAddReal(
-      block_name, "alpha_source_physical_cap", std::numeric_limits<Real>::max());
+      block_name, "alpha_source_physical_cap", 1.0e20);
+      //block_name, "alpha_source_physical_cap", std::numeric_limits<Real>::max());
   PARTHENON_REQUIRE(alpha_source_physical_cap > 0.0,
                     "alpha_source_physical_cap must be positive");
   pkg->AddParam<Real>("alpha_source_physical_cap", alpha_source_physical_cap);
@@ -588,6 +670,7 @@ Initialize_impl(ParameterInput *pin, std::string block_name,
   // Radiation timestep
   pkg->EstimateTimestepMesh = EstimateTimestepMesh;
   pkg->UserWorkBeforeLoopMesh = [](Mesh *pm, ParameterInput *input, SimTime &tm) {
+    InitializePlasmaInventory(pm, tm);
     if (tm.ncycle == 0) ResetTransportOutputTallies(pm, input, tm);
   };
   pkg->UserWorkBeforeOutputMesh = PrepareTransportOutput;

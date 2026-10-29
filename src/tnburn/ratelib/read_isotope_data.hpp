@@ -35,9 +35,10 @@ inline void read_tn_reactions(const std::string filename,
                               std::vector<int> &charges,
                               std::vector<ReactionData> &data) {
   const int num_reactions = reactions.size();
-  herr_t status;
+  herr_t status = 0;
   hid_t file, reaction, reactions_group, mass_group;
   file = H5Fopen(filename.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+  PARTHENON_REQUIRE(file >= 0, "Cannot open TN isotope data file");
   reactions_group = H5Gopen(file, "reactions", H5P_DEFAULT);
   data.resize(reactions.size());
   for (int i = 0; i < reactions.size(); i++) {
@@ -67,8 +68,9 @@ inline void read_tn_reactions(const std::string filename,
   }
   H5Gclose(reactions_group);
   mass_group = H5Gopen(file, "Masses", H5P_DEFAULT);
-  int num_isotopes;
+  int num_isotopes = 0;
   status += H5LTget_attribute_int(file, "Masses", "num_isotopes", &num_isotopes);
+  PARTHENON_REQUIRE(status >= 0 && num_isotopes > 0, "Invalid isotope inventory in TN data");
   all_isotopes.resize(num_isotopes);
   masses.resize(num_isotopes);
   charges.resize(num_isotopes);
@@ -77,6 +79,7 @@ inline void read_tn_reactions(const std::string filename,
   status += H5LTget_attribute_int(file, "Masses", "charges", charges.data());
   H5Gclose(mass_group);
   H5Fclose(file);
+  PARTHENON_REQUIRE(status >= 0, "Failed to read TN isotope data schema");
 }
 #endif
 } // namespace ratelib
