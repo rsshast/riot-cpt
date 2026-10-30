@@ -179,7 +179,8 @@ TaskStatus TransportAlphasImpl(MeshData<Real> *md, const Real t_start, const Rea
         int ip_p = ip, jp_p = jp, kp_p = kp;
         bool on_block = true;
         int steps = 0;
-        while (on_block && t < end) {
+        TransportClock clock(t, end);
+        while (on_block && (Plasma ? clock.remaining > 0 : t < end)) {
           if constexpr (Plasma)
             PARTHENON_REQUIRE(
                 ++steps <= max_steps,
@@ -225,7 +226,6 @@ TaskStatus TransportAlphasImpl(MeshData<Real> *md, const Real t_start, const Rea
               }
               for (int d = 0; d < 3; ++d)
                 direction[d] /= speed;
-              
               const auto stopping = [&](Real e, Real &se, Real &si) {
                 if (!lp) {
                   se = constant * (1 - ion_fraction);
@@ -244,121 +244,10 @@ TaskStatus TransportAlphasImpl(MeshData<Real> *md, const Real t_start, const Rea
                       vmesh(b, fj::plasma_ion_charge(s), kp, jp, ip),
                       vmesh(b, fj::plasma_ion_temperature(), kp, jp, ip), screening);
               };
-/*const auto stopping = [&](Real e, Real &se, Real &si) {
-  if (!lp) {
-    se = constant * (1 - ion_fraction);
-    si = constant * ion_fraction;
-    return;
-  }
-
-  const Real screening = vmesh(b, fj::plasma_screening(), kp, jp, ip);
-  const Real ne = vmesh(b, fj::plasma_electron_density(), kp, jp, ip);
-  const Real te = vmesh(b, fj::plasma_electron_temperature(), kp, jp, ip);
-  const Real ti = vmesh(b, fj::plasma_ion_temperature(), kp, jp, ip);
-
-  const auto checked_channel =
-      [&](int species, Real density, Real mass, Real charge,
-          Real temperature) -> Real {
-    // species=-1 identifies electrons; nonnegative values index ion channels.
-    const auto positive_finite = [](Real value) {
-      return std::isfinite(value) && value > 0;
-    };
-
-    const bool valid_inputs =
-        positive_finite(e) &&
-        std::isfinite(density) && density >= 0 &&
-        positive_finite(mass) &&
-        std::isfinite(charge) &&
-        positive_finite(temperature) &&
-        positive_finite(screening);
-
-    // Match Channel's inactive-species behavior, but detect malformed inputs
-    // rather than silently skipping NaN/negative density or invalid charge.
-    if (std::isfinite(density) && density >= 0 &&
-        std::isfinite(charge) && (density == 0 || charge == 0))
-      return 0;
-
-    // Sentinels mean the calculation was skipped because inputs were invalid.
-    Real v2 = -1, relative2 = -1, reduced_mass = -1;
-    Real classical = -1, quantum = -1, rmin = -1;
-    Real scale = -1, argument = -1, log_lambda = -1;
-
-    if (valid_inputs) {
-      v2 = 2.0 * e / units::MALPHA;
-      relative2 = v2 + 3.0 * units::KB * temperature / mass;
-      reduced_mass = units::MALPHA * mass / (units::MALPHA + mass);
-
-      if (positive_finite(relative2) && positive_finite(reduced_mass)) {
-        classical = std::abs(2.0 * charge) * units::Q * units::Q /
-                    (reduced_mass * relative2);
-        quantum = units::HBAR /
-                  (2.0 * reduced_mass * std::sqrt(relative2));
-        rmin = std::max(classical, quantum);
-        scale = std::sqrt(screening) * rmin;
-
-        if (positive_finite(scale)) {
-          argument = 1.0 / scale;
-          if (positive_finite(argument))
-            log_lambda = std::log(argument);
-        }
-      }
-    }
-
-    if (!valid_inputs || !positive_finite(log_lambda)) {
-      // One record contains enough information to associate the failure with
-      // a particle, a cell, and either the electron or a particular ion channel.
-      printf(
-          "\n[LP_BAD] b=%d particle=%d cell=(%d,%d,%d) species=%d "
-          "t=%.17e xyz=(%.17e,%.17e,%.17e) "
-          "E_eval_erg=%.17e E_eval_MeV=%.17e E_segment_erg=%.17e "
-          "n=%.17e mass_g=%.17e Z=%.17e T_K=%.17e "
-          "ne=%.17e Te_K=%.17e Ti_K=%.17e inv_debye2=%.17e "
-          "v2=%.17e relative2=%.17e reduced_mass_g=%.17e "
-          "b_classical_cm=%.17e b_quantum_cm=%.17e rmin_cm=%.17e "
-          "sqrt_screening_times_rmin=%.17e "
-          "lambda_argument=%.17e log_lambda=%.17e\n",
-          b, n, kp, jp, ip, species,
-          double(t), double(x), double(y), double(z),
-          double(e), double(e / units::MeV_to_ERG), double(energy),
-          double(density), double(mass), double(charge), double(temperature),
-          double(ne), double(te), double(ti), double(screening),
-          double(v2), double(relative2), double(reduced_mass),
-          double(classical), double(quantum), double(rmin),
-          double(scale), double(argument), double(log_lambda));
-
-      // Dump all species to expose which ones contribute to screening.
-      for (int s = 0; s < ns; ++s) {
-        printf("[LP_ION] b=%d particle=%d species=%d "
-               "mass_g=%.17e n=%.17e Z=%.17e Ti_K=%.17e\n",
-               b, n, s, double(masses(s)),
-               double(vmesh(b, fj::plasma_ion_density(s), kp, jp, ip)),
-               double(vmesh(b, fj::plasma_ion_charge(s), kp, jp, ip)),
-               double(ti));
-      }
-
-#if !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
-      fflush(stdout);
-#endif
-      PARTHENON_FAIL("LP diagnostic: invalid inputs or Coulomb logarithm");
-      return 0;
-    }
-
-    return PlasmaStopping::Channel(
-        e, density, mass, charge, temperature, screening);
-  };
-
-  se = checked_channel(-1, ne, units::MBETA, 1.0, te);
-  si = 0;
-  for (int s = 0; s < ns; ++s) {
-    si += checked_channel(
-        s, vmesh(b, fj::plasma_ion_density(s), kp, jp, ip), masses(s),
-        vmesh(b, fj::plasma_ion_charge(s), kp, jp, ip), ti);
-  }
-};*/
               Real se, si;
               stopping(energy, se, si);
               const Real total = se + si;
-              Real h = end - t;
+              Real h = clock.remaining;
               if (total > 0) {
                 h = std::min(h, fraction * units::MALPHA * speed / total);
                 h = std::min(h, (energy - cutoff) / (total * speed));
@@ -379,14 +268,14 @@ TaskStatus TransportAlphasImpl(MeshData<Real> *md, const Real t_start, const Rea
                 if (negative > 0)
                   h = std::min(h, (position[d] - center[d] + 0.5 * width[d]) / negative);
               }
-              PARTHENON_REQUIRE(std::isfinite(h) && h > 0 && t + h > t,
+              PARTHENON_REQUIRE(std::isfinite(h) && h > 0,
                                 "Plasma transport timestep underflow");
               const auto step = TakeDragStep(energy, interacting ? cutoff : Real(0), h,
                                              tolerance, stopping);
               h = step.dt;
               const Real final_speed = step.speed, mid_e = step.electron_stopping,
                          mid_i = step.ion_stopping;
-              PARTHENON_REQUIRE(t + h > t, "LP integration timestep underflow");
+              clock.Advance(h);
               const Real mid_total = mid_e + mid_i;
               const Real loss =
                   mid_total > 0
@@ -399,7 +288,7 @@ TaskStatus TransportAlphasImpl(MeshData<Real> *md, const Real t_start, const Rea
                 position[d] += (u[d] + direction[d] * 0.5 * (speed + final_speed)) * h;
                 ppack_r(b, pa::v(d), n) = u[d] + direction[d] * final_speed;
               }
-              t += h;
+              t = clock.Time();
               segment_distance = 0.5 * (speed + final_speed) * h;
               thermal = interacting && 0.5 * units::MALPHA * final_speed * final_speed <=
                                            cutoff * (1 + 1.e-8);

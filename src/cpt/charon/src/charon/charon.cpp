@@ -422,8 +422,8 @@ Initialize_impl(ParameterInput *pin, std::string block_name,
   PARTHENON_REQUIRE(alpha_weight > 0.0, "alpha_weight must be positive");
   pkg->AddParam<>("alpha_weight", alpha_weight);
   const Real alpha_source_physical_cap = pin->GetOrAddReal(
-      block_name, "alpha_source_physical_cap", 1.0e20);
-      //block_name, "alpha_source_physical_cap", std::numeric_limits<Real>::max());
+      //block_name, "alpha_source_physical_cap", 1.0e20);
+      block_name, "alpha_source_physical_cap", std::numeric_limits<Real>::max());
   PARTHENON_REQUIRE(alpha_source_physical_cap > 0.0,
                     "alpha_source_physical_cap must be positive");
   pkg->AddParam<Real>("alpha_source_physical_cap", alpha_source_physical_cap);

@@ -220,6 +220,26 @@ struct DragStep {
   Real dt, speed, electron_stopping, ion_stopping;
 };
 
+// Resolve short slowing steps relative to the transport interval, rather than
+// adding them to a much larger absolute simulation time after every segment.
+struct TransportClock {
+  Real end, remaining;
+
+  KOKKOS_INLINE_FUNCTION
+  TransportClock(Real start, Real finish) : end(finish), remaining(finish - start) {}
+
+  KOKKOS_INLINE_FUNCTION
+  void Advance(Real h) {
+    const Real next = remaining - h;
+    PARTHENON_REQUIRE(std::isfinite(h) && h > 0 && next >= 0 && next < remaining,
+                      "Plasma transport interval timestep underflow");
+    remaining = next;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real Time() const { return end - remaining; }
+};
+
 // Embedded Euler/midpoint estimate; velocity is relative to a frozen fluid frame.
 template <typename Stopping>
 KOKKOS_INLINE_FUNCTION DragStep TakeDragStep(Real energy, Real cutoff, Real h,
