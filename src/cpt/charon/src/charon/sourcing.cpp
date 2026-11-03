@@ -82,10 +82,11 @@ TaskStatus SourceAlphasImpl(T *md, const Real t_start, const Real dt) {
     if constexpr (Plasma && Diagnostics) {
       return MakePackDescriptor<fj::source_num_per_cell, fj::source_ew_per_cell,
                                 fj::delta_num_per_cell, fjh::density,
-                                fjh::alpha_source, fj::plasma_velocity>(resolved_pkgs.get());
+                                fjh::alpha_source, fj::plasma_velocity,
+                                fj::source_alpha_energy>(resolved_pkgs.get());
     } else if constexpr (Plasma) {
       return MakePackDescriptor<fjh::density, fjh::alpha_source,
-                                fj::plasma_velocity>(resolved_pkgs.get());
+                                fj::plasma_velocity, fj::source_alpha_energy>(resolved_pkgs.get());
     } else if constexpr (Diagnostics) {
       return MakePackDescriptor<fj::source_num_per_cell, fj::source_ew_per_cell,
                                 fj::delta_num_per_cell,
@@ -500,7 +501,7 @@ TaskStatus SourceAlphasImpl(T *md, const Real t_start, const Real dt) {
                       "Fuel source did not find any cells above fuel_density_threshold.");
     // Verbose sourcing
     if (parthenon::Globals::my_rank == 0) {
-      std::cout << "[CHARon Sourcing]"
+      std::cout << "[Charon Sourcing]"
                 << " | Fuel source cells: " << fuel_source_cells
                 << " | fuel_density_threshold: " << fuel_density_threshold
                 << std::endl;
@@ -879,7 +880,7 @@ TaskStatus SourceAlphasImpl(T *md, const Real t_start, const Real dt) {
                                       updated_cumulative_alphas);
 
   if (parthenon::Globals::my_rank == 0 && step_total > 0) {
-    std::cout << "[CHARon Sourcing]"
+    std::cout << "[Charon Sourcing]"
               << " | Sourced this stage: " << step_total
               << " | Cumulative weighted alphas: " << updated_cumulative_alphas
               << " / " << alpha_source_physical_cap << std::endl;
@@ -973,7 +974,11 @@ TaskStatus SourceAlphasImpl(T *md, const Real t_start, const Real dt) {
         // Starting index and length of particles in this cell
         const int &pstart_idx = prefix_sum(b, cell_idx_1d);
 
-        const Real vv = std::sqrt((2.0 * E0) / MALPHA);
+        const Real birth_energy = [&]() {
+          if constexpr (Plasma) return vmesh(b, fj::source_alpha_energy(), k, j, i);
+          else return E0;
+        }();
+        const Real vv = std::sqrt((2.0 * birth_energy) / MALPHA);
         for (int np = pstart_idx; np < pstart_idx + new_part_per_cell; np++) {
           const int &n = new_contexts(b).GetNewParticleIndex(np);
           ppack_i(b, pa::ijk(0), n) = i;
@@ -1081,7 +1086,7 @@ TaskStatus SourceAlphasImpl(T *md, const Real t_start, const Real dt) {
               ppack_r(b, pa::v(0), n), ppack_r(b, pa::v(1), n), ppack_r(b, pa::v(2), n));
           }
 #endif
-          ppack_r(b, pa::energy(), n) = E0;// MeV
+          ppack_r(b, pa::energy(), n) = birth_energy;
           if constexpr (Plasma) {
             Real lab_speed2 = 0.0;
             for (int d = 0; d < 3; ++d) {

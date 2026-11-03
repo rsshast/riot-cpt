@@ -264,6 +264,26 @@ KOKKOS_INLINE_FUNCTION DragStep TakeDragStep(Real energy, Real cutoff, Real h,
   return {0, 0, 0, 0};
 }
 
+struct PlasmaTransfer {
+  Real mass;
+  Real momentum[3];
+  Real energy;
+};
+
+// Conserved lab-frame transfer. A surviving particle never transfers rest mass.
+KOKKOS_INLINE_FUNCTION
+PlasmaTransfer TransferToFluid(const Real initial_velocity[3],
+                               const Real final_velocity[3], Real initial_energy,
+                               Real final_energy, Real weight, bool thermalized) {
+  PlasmaTransfer result{};
+  result.mass = thermalized ? weight * units::MALPHA : Real(0);
+  result.energy = weight * (initial_energy - (thermalized ? Real(0) : final_energy));
+  for (int d = 0; d < 3; ++d)
+    result.momentum[d] = weight * units::MALPHA *
+        (initial_velocity[d] - (thermalized ? Real(0) : final_velocity[d]));
+  return result;
+}
+
 // Accumulator is physical particles, not histories. No production is discarded.
 KOKKOS_INLINE_FUNCTION
 Real SourceHistoryCount(Real produced, Real weight, Real &pending) {

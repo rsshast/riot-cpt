@@ -58,7 +58,7 @@ CHARON_FIELD_VARIABLE(field.charon, residence_tally);
 CHARON_FIELD_VARIABLE(field.charon, spower_tally);
 CHARON_FIELD_VARIABLE(field.charon, spower_sum);
 CHARON_FIELD_VARIABLE(field.charon, spower_count);
-// TN
+// Opt-in TN/plasma bridge. Ion arrays are runtime-sized; use direct pack indexing.
 CHARON_FIELD_VARIABLE(field.charon, plasma_velocity);
 CHARON_FIELD_VARIABLE(field.charon, plasma_electron_density);
 CHARON_FIELD_VARIABLE(field.charon, plasma_electron_temperature);
@@ -75,6 +75,15 @@ CHARON_FIELD_VARIABLE(field.charon, electron_heat);
 CHARON_FIELD_VARIABLE(field.charon, ion_heat);
 CHARON_FIELD_VARIABLE(field.charon, escaped_alphas);
 CHARON_FIELD_VARIABLE(field.charon, escaped_energy);
+CHARON_FIELD_VARIABLE(field.charon, deposited_mass_step);
+CHARON_FIELD_VARIABLE(field.charon, deposited_momentum_step);
+CHARON_FIELD_VARIABLE(field.charon, deposited_lab_energy_step);
+CHARON_FIELD_VARIABLE(field.charon, thermalized_alphas);
+CHARON_FIELD_VARIABLE(field.charon, neutron_mass);
+CHARON_FIELD_VARIABLE(field.charon, neutron_energy);
+CHARON_FIELD_VARIABLE(field.charon, nuclear_mass_defect);
+CHARON_FIELD_VARIABLE(field.charon, pending_alpha_energy);
+CHARON_FIELD_VARIABLE(field.charon, source_alpha_energy);
 
 namespace host {
 typedef HOST_DENSITY density;

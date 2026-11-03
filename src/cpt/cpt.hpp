@@ -12,6 +12,10 @@
 
 namespace CPT {
 
+// Host entry point for testing the depletion calculation used by the CPT kernel.
+parthenon::Real AcceptedDTReactions(parthenon::Real n1, parthenon::Real n2,
+                                   parthenon::Real k, parthenon::Real dt);
+
 std::shared_ptr<parthenon::StateDescriptor>
 Initialize(parthenon::ParameterInput *pin,
            parthenon::StateDescriptor *materials);

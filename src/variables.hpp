@@ -136,6 +136,8 @@ VARIABLE_SCALAR(c.c.mat, phase_rho_sum, true);
 VARIABLE_SCALAR(c.c.mat, internal_energy, true);
 VARIABLE_SCALAR(c.c.mat, volume_fraction, true);
 VARIABLE_SCALAR(c.c.mat, iso, true);
+// Thermalized CPT helium mass density, carried with its receiving material.
+VARIABLE_SCALAR(c.c.mat, cpt_helium_rho, true);
 VARIABLE_SCALAR(c.c.mat, rho_sh, true);
 VARIABLE_SCALAR(c.c.mat, tn_reaction_density, true);
 VARIABLE_VECTOR(c.c.mat, deviatoric_stress, true, 5);
@@ -177,6 +179,7 @@ VARIABLE_SCALAR(c.m, temperature, true);
 VARIABLE_SCALAR(c.m, pressure, true);
 VARIABLE_SCALAR(c.m, bulk_modulus, true);
 VARIABLE_SCALAR(c.m, iso, true);
+VARIABLE_SCALAR(c.m, cpt_helium_mass_fraction, true);
 VARIABLE_SCALAR(c.m, rho_sh, true);
 VARIABLE_SCALAR(c.m, he_psi, true);
 VARIABLE_SCALAR(c.m, awsd_zeta, true);

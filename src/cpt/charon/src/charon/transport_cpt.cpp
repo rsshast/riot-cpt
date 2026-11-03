@@ -93,7 +93,9 @@ TaskStatus TransportAlphasImpl(MeshData<Real> *md, const Real t_start, const Rea
           fj::plasma_electron_temperature, fj::plasma_ion_temperature,
           fj::plasma_screening, fj::plasma_ion_density, fj::plasma_ion_charge,
           fj::electron_heat_step, fj::ion_heat_step, fj::electron_heat, fj::ion_heat,
-          fj::escaped_alphas, fj::escaped_energy>(pm->resolved_packages.get());
+          fj::escaped_alphas, fj::escaped_energy, fj::deposited_mass_step,
+          fj::deposited_momentum_step, fj::deposited_lab_energy_step,
+          fj::thermalized_alphas>(pm->resolved_packages.get());
     } else if constexpr (Compact) {
       return MakePackDescriptor<fjh::density, fjh::temperature>(
           pm->resolved_packages.get());
@@ -195,8 +197,8 @@ TaskStatus TransportAlphasImpl(MeshData<Real> *md, const Real t_start, const Rea
           Real segment_distance = 0, segment_stopping = 0, E_dep = 0;
           Real qe = 0, qi = 0;
           Real old_velocity[3] = {0, 0, 0};
-          if constexpr (!Plasma && !Compact) {
-            if (tally_mass_momentum)
+          if constexpr (Plasma || !Compact) {
+            if (Plasma || tally_mass_momentum)
               for (int d = 0; d < 3; ++d)
                 old_velocity[d] = ppack_r(b, pa::v(d), n);
           }
@@ -448,6 +450,24 @@ TaskStatus TransportAlphasImpl(MeshData<Real> *md, const Real t_start, const Rea
             for (int d = 0; d < 3; ++d)
               ee +=
                   0.5 * units::MALPHA * ppack_r(b, pa::v(d), n) * ppack_r(b, pa::v(d), n);
+            // Transfer lab-frame momentum/energy consistently with the fluid's
+            // conserved variables. Relative heat alone omits drag work and the
+            // kinetic energy accompanying mass returned at thermalization.
+            const Real final_velocity[3] = {vx, vy, vz};
+            const auto transfer = TransferToFluid(old_velocity, final_velocity,
+                                                  ee_i, ee, ww, thermal);
+            for (int d = 0; d < 3; ++d)
+              Kokkos::atomic_add(&vmesh(b, fj::deposited_momentum_step(d), kp, jp, ip),
+                                transfer.momentum[d]);
+            Kokkos::atomic_add(&vmesh(b, fj::deposited_lab_energy_step(), kp, jp, ip),
+                              transfer.energy);
+            if (thermal) {
+              // Alpha rest mass is deposited exactly once, only on removal by
+              // thermalization. Slowing-down segments transfer no mass.
+              Kokkos::atomic_add(&vmesh(b, fj::deposited_mass_step(), kp, jp, ip),
+                                transfer.mass);
+              Kokkos::atomic_add(&vmesh(b, fj::thermalized_alphas(), kp, jp, ip), ww);
+            }
           }
           if constexpr (Compact)
             Kokkos::atomic_add(&heat(b, fj::deposited_energy_step(), kp, jp, ip), E_dep);

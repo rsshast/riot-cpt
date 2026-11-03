@@ -110,7 +110,9 @@ void InitializePlasmaInventory(Mesh *pm, const SimTime &tm) {
     auto desc =
         MakePackDescriptor<fj::pending_alphas, fj::physical_alphas, fj::sampled_alphas,
                            fj::electron_heat, fj::ion_heat, fj::escaped_alphas,
-                           fj::escaped_energy>(pm->resolved_packages.get());
+                           fj::escaped_energy, fj::pending_alpha_energy,
+                           fj::thermalized_alphas, fj::neutron_mass,
+                           fj::neutron_energy, fj::nuclear_mass_defect>(pm->resolved_packages.get());
     auto v = desc.GetPack(md.get());
     auto ib = md->GetBoundsI(IndexDomain::interior);
     auto jb = md->GetBoundsJ(IndexDomain::interior);
@@ -127,6 +129,11 @@ void InitializePlasmaInventory(Mesh *pm, const SimTime &tm) {
           v(b, fj::ion_heat(), k, j, i) = 0;
           v(b, fj::escaped_alphas(), k, j, i) = 0;
           v(b, fj::escaped_energy(), k, j, i) = 0;
+          v(b, fj::pending_alpha_energy(), k, j, i) = 0;
+          v(b, fj::thermalized_alphas(), k, j, i) = 0;
+          v(b, fj::neutron_mass(), k, j, i) = 0;
+          v(b, fj::neutron_energy(), k, j, i) = 0;
+          v(b, fj::nuclear_mass_defect(), k, j, i) = 0;
         });
   }
 }
@@ -422,7 +429,6 @@ Initialize_impl(ParameterInput *pin, std::string block_name,
   PARTHENON_REQUIRE(alpha_weight > 0.0, "alpha_weight must be positive");
   pkg->AddParam<>("alpha_weight", alpha_weight);
   const Real alpha_source_physical_cap = pin->GetOrAddReal(
-      //block_name, "alpha_source_physical_cap", 1.0e20);
       block_name, "alpha_source_physical_cap", std::numeric_limits<Real>::max());
   PARTHENON_REQUIRE(alpha_source_physical_cap > 0.0,
                     "alpha_source_physical_cap must be positive");
