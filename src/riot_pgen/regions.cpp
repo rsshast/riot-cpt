@@ -246,7 +246,7 @@ BlockInitData::BlockInitData(ParameterInput *pin)
   do_3t = pin->GetBoolean("physics", "ionization");
   if (do_3t) fully_ionized = pin->GetBoolean("ionization", "fully_ionized");
   if (do_3t) fully_ionize_hydrogen =
-    pin->GetOrAddBoolean("ionization", "fully_ionize_hydrogen", false);
+      pin->GetOrAddBoolean("ionization", "fully_ionize_hydrogen", false);
 }
 
 //----------------------------------------------------------------------------------------
@@ -346,16 +346,61 @@ void BlockInitData::InitBlock(MeshBlock *pmb, ParameterInput *pin) {
     pmb->DeallocateSparse(rho_mat_name);
   }
 
-  // mark cells that lie cleanly within a single region
-  auto region_cnts = set_clean_mask();
+  radial_average = pin->GetOrAddBoolean("regions", "spherical_volume_average", false);
+  radial_samples.clear();
+  std::vector<int> region_cnts;
+  if (radial_average) {
+    PARTHENON_REQUIRE(parthenon::IsCoord<parthenon::UniformSpherical>() && ndim == 1,
+                      "spherical_volume_average requires 1D spherical coordinates");
+    auto breaks = pin->GetVector<Real>("regions", "radial_breakpoints");
+    std::sort(breaks.begin(), breaks.end());
+    const Real nodes[8] = {-0.9602898564975363, -0.7966664774136267, -0.5255324099163290,
+                           -0.1834346424956498, 0.1834346424956498,  0.5255324099163290,
+                           0.7966664774136267,  0.9602898564975363};
+    const Real weights[8] = {0.1012285362903763, 0.2223810344533745, 0.3137066458778873,
+                             0.3626837833783620, 0.3626837833783620, 0.3137066458778873,
+                             0.2223810344533745, 0.1012285362903763};
+    region_cnts.assign(regions.size(), 0);
+    for (int i = ib[state].s; i <= ib[state].e; ++i) {
+      const int k = kb[state].s, j = jb[state].s;
+      const Real inner = coords->Xf<X1DIR>(k, j, i);
+      const Real outer = coords->Xf<X1DIR>(k, j, i + 1);
+      PARTHENON_REQUIRE(inner >= 0 && outer > inner, "Invalid radial shell faces");
+      const Real radial_volume = (outer * outer * outer - inner * inner * inner) / 3;
+      std::vector<Real> faces{inner};
+      for (auto radius : breaks)
+        if (radius > inner && radius < outer) faces.push_back(radius);
+      faces.push_back(outer);
+      for (int l = 1; l < faces.size(); ++l) {
+        const Real half = 0.5 * (faces[l] - faces[l - 1]);
+        if (half <= 0) continue;
+        for (int q = 0; q < 8; ++q) {
+          const Real radius = 0.5 * (faces[l] + faces[l - 1]) + half * nodes[q];
+          sample_positions_t x(1);
+          x(0, 0) = radius;
+          x(0, 1) = 0;
+          x(0, 2) = 0;
+          const int r = set_mask(x)[0];
+          PARTHENON_REQUIRE(r >= 0, "Uncovered radial initialization sample");
+          radial_samples.push_back(
+              {i, r, radius, half * weights[q] * radius * radius / radial_volume});
+          ++region_cnts[r];
+        }
+      }
+    }
+  } else {
+    // mark cells that lie cleanly within a single region
+    region_cnts = set_clean_mask();
+  }
   // a bit of a hack
   auto &elec_eos = (do_3t ? electron_eos_host : eos_host);
   // initialize the state in all cells marked as clean
   set_clean_state(pmb, eos_host, elec_eos, eos_from_matid, region_cnts, var_map,
                   var_mirror_map, mat_tied_mirror_vars);
   // initialize the state in all cells not marked as clean
-  auto dirty_map = set_dirty_state(pmb, eos_host, elec_eos, eos_from_matid, var_map,
-                                   var_mirror_map, mat_tied_mirror_vars, matids);
+  if (!radial_average)
+    set_dirty_state(pmb, eos_host, elec_eos, eos_from_matid, var_map, var_mirror_map,
+                    mat_tied_mirror_vars, matids);
 
   var_mirror_map.erase("does_not_exist");
   for (auto v : var_mirror_map) {

@@ -725,7 +725,8 @@ class BlockInitData {
     Real rho, sie, sie_e, zbar;
     Real anuc = ion_eos.MeanAtomicMass();
     Real znuc = ion_eos.MeanAtomicNumber();
-    const bool fully_ionized = this->fully_ionized || (fully_ionize_hydrogen && znuc == 1.0);
+    const bool fully_ionized = this->fully_ionized ||
+                               (fully_ionize_hydrogen && znuc == 1.0);
     if (fully_ionized) {
       zbar = znuc;
     };
@@ -803,6 +804,15 @@ class BlockInitData {
   bool near_boundary(const int k0, const int j0, const int i0, const int reg_id) const;
   std::vector<int> set_clean_mask();
 
+  // Optional volume quadrature for radial profiles. Actual mesh faces define
+  // the integration intervals; profile/interface breakpoints split them.
+  struct RadialSample {
+    int i, region;
+    Real radius, weight;
+  };
+  std::vector<RadialSample> radial_samples;
+  bool radial_average = false;
+
   template <typename host_mirror_t>
   void set_clean_state(MeshBlock *pmb, std::vector<RiotEOS::EOS> &eos_v,
                        std::vector<RiotEOS::EOS> &electron_eos_v,
@@ -822,26 +832,46 @@ class BlockInitData {
     for (int r = 0; r < regions.size(); r++) {
       if (reg_cnt[r] == 0) continue;
       int n = 0;
-      xs.resize(num_state);
-      block_loop<state>([&](const int k, const int j, const int i) {
-        if (region_id(k, j, i) == r) {
+      std::vector<std::tuple<int, int, int, Real>> sample_cells;
+      if (radial_average) {
+        xs.resize(radial_samples.size());
+        for (const auto &sample : radial_samples) {
+          if (sample.region != r) continue;
+          xs(n, 0) = sample.radius;
+          xs(n, 1) = 0;
+          xs(n, 2) = 0;
+          sample_cells.emplace_back(kb[state].s, jb[state].s, sample.i, sample.weight);
+          ++n;
+        }
+      } else {
+        xs.resize(num_state);
+        block_loop<state>([&](const int k, const int j, const int i) {
+          if (region_id(k, j, i) != r) return;
           auto [xx, yy, zz] =
               to_cartesian(coords->Xc<X1DIR>(k, j, i), coords->Xc<X2DIR>(k, j, i),
                            coords->Xc<X3DIR>(k, j, i));
           xs(n, 0) = xx;
           xs(n, 1) = yy;
           xs(n, 2) = zz;
-          n++;
-        }
-      });
+          sample_cells.emplace_back(k, j, i, Real(1));
+          ++n;
+        });
+      }
+      auto for_samples = [&](auto &&f) {
+        for (const auto &[k, j, i, w] : sample_cells)
+          f(k, j, i, w);
+      };
       xs.resize(n);
       vs.reshape(n, 1);
       // fill in bulk tied scalars, just = 1 if in the region
       for (const auto &scalar : regions[r].bulk_tied_scalars) {
         auto scl = var_mirror_map[scalar];
-        block_loop<state>([&](const int k, const int j, const int i) {
-          scl(k, j, i) = (region_id(k, j, i) == r);
-        });
+        if (!radial_average)
+          block_loop<state>([&](const int k, const int j, const int i) {
+            scl(k, j, i) = (region_id(k, j, i) == r);
+          });
+        else
+          for_samples([&](int k, int j, int i, Real w) { scl(k, j, i) += w; });
       }
 
       for (const auto &bulk : regions[r].bulk_state) {
@@ -852,10 +882,10 @@ class BlockInitData {
         vs.reshape(n, ncomp);
         bulk.second(xs, vs);
         n = 0;
-        block_loop<state>([&](const int k, const int j, const int i) {
-          if (region_id(k, j, i) == r) {
+        for_samples([&](const int k, const int j, const int i, const Real sample_weight) {
+          {
             for (int l = 0; l < ncomp; l++) {
-              q(l, k, j, i) = vs(n, l);
+              q(l, k, j, i) += sample_weight * vs(n, l);
             }
             n++;
           }
@@ -899,6 +929,15 @@ class BlockInitData {
           var_mirror_map[rho_mat_name] = var_map[rho_mat_name]->data.GetHostMirror();
           for (auto &mv : mat_tied_mirror_vars[mat_id]) {
             var_mirror_map[mv] = var_map.at(mv)->data.GetHostMirror();
+            if (radial_average) {
+              auto data = var_mirror_map[mv];
+              auto var = var_map.at(mv);
+              for (int n = 0; n < var->GetDim(6); ++n)
+                for (int m = 0; m < var->GetDim(5); ++m)
+                  for (int l = 0; l < var->GetDim(4); ++l)
+                    block_loop<state>(
+                        [&](int k, int j, int i) { data(n, m, l, k, j, i) = 0; });
+            }
           }
           // must zero out rho and vfrac everywhere on the block
           auto rho = var_mirror_map[rho_mat_name];
@@ -934,61 +973,71 @@ class BlockInitData {
           auto &eos = eos_v[eos_from_matid[mat_id] + p];
           auto &electron_eos = electron_eos_v[eos_from_matid[mat_id] + p];
           n = 0;
-          block_loop<state>([&](const int k, const int j, const int i) {
-            if (region_id(k, j, i) == r) {
-              // copy material state
-              for (int l = 0; l < num_mat_init_fields; l++)
-                local_state[l] = ms[l](n, 0);
-              // throw in electron temperature
-              if (do_3t) {
-                if (Te.size() > 0)
-                  local_state[num_mat_init_fields] = Te(n, 0);
-                else
-                  local_state[num_mat_init_fields] =
-                      0.0; // electron temp must be in equilibrium
-              }
-              // copy velocities
-              for (int l = num_mat_init_fields + do_3t;
-                   l < num_mat_init_fields + 3 + do_3t; l++) {
-                local_state[l] = vs(n, l - num_mat_init_fields - do_3t);
-              }
-              if (do_3t) {
-                set_cell_conserved_3t(
-                    regions[r].init_type[mat_id], phase_frac(n, p), local_state.data(),
-                    eos, electron_eos, vfrac(p, k, j, i), rho(p, k, j, i),
-                    rhov(0, k, j, i), rhov(1, k, j, i), rhov(2, k, j, i), E(k, j, i),
-                    u_e(k, j, i), rhozbar(p, k, j, i));
-              } else {
-                set_cell_conserved(regions[r].init_type[mat_id], phase_frac(n, p),
-                                   local_state.data(), eos, vfrac(p, k, j, i),
-                                   rho(p, k, j, i), rhov(0, k, j, i), rhov(1, k, j, i),
-                                   rhov(2, k, j, i), E(k, j, i));
-              }
-              if (auto it = regions[r].mat_tied_scalars.find(mat_id);
-                  it != regions[r].mat_tied_scalars.end()) {
-                var_mirror_map[it->second](k, j, i) =
-                    (p > 0 ? var_mirror_map[it->second](k, j, i) : 0) + rho(p, k, j, i);
-              }
-              for (auto &sp_bulk : regions[r].specific_bulk_state) {
-                if (var_mirror_map.count(sp_bulk.first) == 0) continue;
-                int ncomp = var_map[sp_bulk.first]->NumComponents();
-                for (int l = 0; l < ncomp; l++) {
-                  var_mirror_map[sp_bulk.first](l, k, j, i) +=
-                      rho(p, k, j, i) * ss[sp_bulk.first](n, l);
+          for_samples(
+              [&](const int k, const int j, const int i, const Real sample_weight) {
+                {
+                  // copy material state
+                  for (int l = 0; l < num_mat_init_fields; l++)
+                    local_state[l] = ms[l](n, 0);
+                  // throw in electron temperature
+                  if (do_3t) {
+                    if (Te.size() > 0)
+                      local_state[num_mat_init_fields] = Te(n, 0);
+                    else
+                      local_state[num_mat_init_fields] =
+                          0.0; // electron temp must be in equilibrium
+                  }
+                  // copy velocities
+                  for (int l = num_mat_init_fields + do_3t;
+                       l < num_mat_init_fields + 3 + do_3t; l++) {
+                    local_state[l] = vs(n, l - num_mat_init_fields - do_3t);
+                  }
+                  const Real previous_rho = rho(p, k, j, i);
+                  if (do_3t) {
+                    set_cell_conserved_3t(
+                        regions[r].init_type[mat_id], sample_weight * phase_frac(n, p),
+                        local_state.data(), eos, electron_eos, vfrac(p, k, j, i),
+                        rho(p, k, j, i), rhov(0, k, j, i), rhov(1, k, j, i),
+                        rhov(2, k, j, i), E(k, j, i), u_e(k, j, i), rhozbar(p, k, j, i));
+                  } else {
+                    set_cell_conserved(
+                        regions[r].init_type[mat_id], sample_weight * phase_frac(n, p),
+                        local_state.data(), eos, vfrac(p, k, j, i), rho(p, k, j, i),
+                        rhov(0, k, j, i), rhov(1, k, j, i), rhov(2, k, j, i), E(k, j, i));
+                  }
+                  const Real added_rho = rho(p, k, j, i) - previous_rho;
+                  if (auto it = regions[r].mat_tied_scalars.find(mat_id);
+                      it != regions[r].mat_tied_scalars.end()) {
+                    if (radial_average)
+                      var_mirror_map[it->second](k, j, i) += added_rho;
+                    else
+                      var_mirror_map[it->second](k, j, i) =
+                          (p > 0 ? var_mirror_map[it->second](k, j, i) : 0) + added_rho;
+                  }
+                  for (auto &sp_bulk : regions[r].specific_bulk_state) {
+                    if (var_mirror_map.count(sp_bulk.first) == 0) continue;
+                    int ncomp = var_map[sp_bulk.first]->NumComponents();
+                    for (int l = 0; l < ncomp; l++) {
+                      var_mirror_map[sp_bulk.first](l, k, j, i) +=
+                          added_rho * ss[sp_bulk.first](n, l);
+                    }
+                  }
+                  for (auto &sp_mat : regions[r].specific_mat_state[mat_id]) {
+                    if (var_mirror_map.count(sp_mat.first) == 0) continue;
+                    int ncomp = var_map[sp_mat.first]->NumComponents();
+                    for (int l = 0; l < ncomp; l++) {
+                      if (radial_average)
+                        var_mirror_map[sp_mat.first](l, k, j, i) +=
+                            added_rho * ss[sp_mat.first](n, l);
+                      else
+                        var_mirror_map[sp_mat.first](l, k, j, i) =
+                            (p > 0 ? var_mirror_map[sp_mat.first](l, k, j, i) : 0) +
+                            added_rho * ss[sp_mat.first](n, l);
+                    }
+                  }
+                  n++;
                 }
-              }
-              for (auto &sp_mat : regions[r].specific_mat_state[mat_id]) {
-                if (var_mirror_map.count(sp_mat.first) == 0) continue;
-                int ncomp = var_map[sp_mat.first]->NumComponents();
-                for (int l = 0; l < ncomp; l++) {
-                  var_mirror_map[sp_mat.first](l, k, j, i) =
-                      (p > 0 ? var_mirror_map[sp_mat.first](l, k, j, i) : 0) +
-                      rho(p, k, j, i) * ss[sp_mat.first](n, l);
-                }
-              }
-              n++;
-            }
-          });
+              });
         }
       }
     }

@@ -4,6 +4,7 @@
 // This file was made in part with generative AI.
 
 #include "cpt/cpt.hpp"
+#include "cpt/spherical.hpp"
 
 #include <algorithm>
 #include <climits>
@@ -718,6 +719,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin, StateDescriptor
       {Metadata::Cell, Metadata::Derived, Metadata::OneCopy});
   pkg->AddField<ccbulk::cpt_alpha_source>(source_metadata);
   InitializeTNPlasma(pin, pkg.get(), materials);
+  if (pkg->Param<bool>("spherical_transport")) spherical::Initialize(pin, pkg.get());
   return pkg;
 }
 
@@ -736,7 +738,9 @@ TaskListStatus Step(Mesh *pm, SimTime &tm, const Real dt) {
         PrepareTNPlasma(pm->mesh_data.GetOrAdd("base", p).get(), 0, false);
     }
   }
-  if (!HasCPTWork(pm, dt)) {
+  if (pkg->Param<bool>("spherical_transport")) {
+    spherical::Step(pm, tm.time, dt);
+  } else if (!HasCPTWork(pm, dt)) {
     auto scratch = pkg->Param<std::shared_ptr<charon::TransportScratch>>(
         "transport_scratch");
     bool same_blocks = scratch->inactive_blocks.size() == pm->block_list.size();
@@ -754,7 +758,9 @@ TaskListStatus Step(Mesh *pm, SimTime &tm, const Real dt) {
   }
 
   *pkg->MutableParam<bool>("inactive_fields_dirty") = true;
-  auto status = charon::RadiationStep(pm, tm.time, dt).Execute();
+  auto status = pkg->Param<bool>("spherical_transport")
+                    ? TaskListStatus::complete
+                    : charon::RadiationStep(pm, tm.time, dt).Execute();
   if (status != TaskListStatus::complete) return status;
 
   if (!pkg->Param<bool>("do_feedback")) return status;

@@ -1,5 +1,5 @@
 //========================================================================================
-// (C) (or copyright) 2023-2026. Triad National Security, LLC. All rights reserved.
+// (C) (or copyright) 2024-2025. Triad National Security, LLC. All rights reserved.
 //
 // This program was produced under U.S. Government contract 89233218CNA000001 for Los
 // Alamos National Laboratory (LANL), which is operated by Triad National Security, LLC
@@ -26,6 +26,30 @@
 
 namespace charon {
 using namespace units;
+
+struct ParticlePeriodicBoundaries {
+  bool inner[3] = {false, false, false};
+  bool outer[3] = {false, false, false};
+};
+
+KOKKOS_INLINE_FUNCTION
+bool EscapesNonPeriodicAxis(Real x, Real lower, Real upper, bool inner_periodic,
+                            bool outer_periodic) {
+  return (x < lower && !inner_periodic) || (x >= upper && !outer_periodic);
+}
+
+KOKKOS_INLINE_FUNCTION
+Real WrapPeriodicAxis(Real x, Real lower, Real upper, bool inner_periodic,
+                      bool outer_periodic) {
+  if ((x < lower && inner_periodic) || (x >= upper && outer_periodic)) {
+    const Real length = upper - lower;
+    const Real offset = x - lower;
+    x = lower + (offset - length * std::floor(offset / length));
+    // Keep the periodic interval half-open even at floating-point endpoints.
+    if (x >= upper || x < lower) x = lower;
+  }
+  return x;
+}
 
 // Interior-cell workspace for the single mesh-data partition used by RadiationStep.
 // Sourcing refreshes counts on every call, including calls that create no particles.

@@ -67,6 +67,40 @@ TaskStatus MeshReceive(MeshData<Real> *md) {
     }
   }
 
+  const auto periodic = md->GetParentPointer()->packages.Get("charon")
+                            ->Param<ParticlePeriodicBoundaries>("particle_periodic_boundaries");
+  if (periodic.inner[0] || periodic.outer[0] || periodic.inner[1] || periodic.outer[1] ||
+      periodic.inner[2] || periodic.outer[2]) {
+    // Route with the unwrapped position first, so periodic crossings reach the
+    // adjacent periodic neighbor even on a multi-block mesh. Wrap on receipt,
+    // before CheckCompletion or another transport kernel indexes the position.
+    static auto desc = MakeSwarmPackDescriptor<swarm_position::x, swarm_position::y,
+                                               swarm_position::z>(alphas_swarm_name);
+    auto particles = desc.GetPack(md);
+    const int ndim = md->GetParentPointer()->ndim;
+    if (particles.GetMaxFlatIndex() < 0) return status;
+    parthenon::par_for(
+        DEFAULT_LOOP_PATTERN, "WrapPeriodicCPT", DevExecSpace(), 0,
+        particles.GetMaxFlatIndex(), KOKKOS_LAMBDA(const int idx) {
+          auto [b, n] = particles.GetBlockParticleIndices(idx);
+          const auto swarm = particles.GetContext(b);
+          if (!swarm.IsActive(n)) return;
+          auto &x = particles(b, swarm_position::x(), n);
+          x = WrapPeriodicAxis(x, swarm.x_min_global_, swarm.x_max_global_,
+                               periodic.inner[0], periodic.outer[0]);
+          if (ndim > 1) {
+            auto &y = particles(b, swarm_position::y(), n);
+            y = WrapPeriodicAxis(y, swarm.y_min_global_, swarm.y_max_global_,
+                                 periodic.inner[1], periodic.outer[1]);
+          }
+          if (ndim > 2) {
+            auto &z = particles(b, swarm_position::z(), n);
+            z = WrapPeriodicAxis(z, swarm.z_min_global_, swarm.z_max_global_,
+                                 periodic.inner[2], periodic.outer[2]);
+          }
+        });
+  }
+
   return status;
 }
 namespace {
@@ -328,20 +362,34 @@ std::shared_ptr<StateDescriptor>
 Initialize_impl(ParameterInput *pin, std::string block_name,
                 const bool allow_compact_tallies) {
   auto pkg = std::make_shared<StateDescriptor>("charon");
+  const bool spherical_transport = parthenon::IsCoord<parthenon::UniformSpherical>();
+  pkg->AddParam("spherical_transport", spherical_transport);
+  ParticlePeriodicBoundaries periodic;
+  const char *inner_keys[3] = {"ix1_bc", "ix2_bc", "ix3_bc"};
+  const char *outer_keys[3] = {"ox1_bc", "ox2_bc", "ox3_bc"};
+  for (int d = 0; d < 3; ++d) {
+    periodic.inner[d] = pin->DoesParameterExist("parthenon/mesh", inner_keys[d]) &&
+                        pin->GetString("parthenon/mesh", inner_keys[d]) == "periodic";
+    periodic.outer[d] = pin->DoesParameterExist("parthenon/mesh", outer_keys[d]) &&
+                        pin->GetString("parthenon/mesh", outer_keys[d]) == "periodic";
+  }
+  pkg->AddParam("particle_periodic_boundaries", periodic);
   pkg->AddParam("tn_plasma", pin->GetOrAddBoolean(block_name, "tn_plasma", false));
   if (pkg->Param<bool>("tn_plasma")) {
     const Real cutoff = pin->GetOrAddReal(block_name, "thermalization_mev", 0.2);
-    const Real tolerance = pin->GetOrAddReal(block_name, "plasma_velocity_tolerance", 1.e-4);
+    const Real tolerance =
+        pin->GetOrAddReal(block_name, "plasma_velocity_tolerance", 1.e-4);
     const Real fraction = pin->GetOrAddReal(block_name, "plasma_fractional_step", 0.02);
     const Real ion_fraction = pin->GetOrAddReal(block_name, "constant_ion_fraction", 0.5);
     const int limit = pin->GetOrAddInteger(block_name, "plasma_max_substeps", 100000);
     PARTHENON_REQUIRE(std::isfinite(cutoff) && cutoff > 0 && cutoff < 3.54 &&
-        std::isfinite(tolerance) && tolerance > 0 && tolerance < 1 &&
-        std::isfinite(fraction) && fraction > 0 && fraction <= 0.1 &&
-        ion_fraction >= 0 && ion_fraction <= 1 && limit > 0,
-        "Invalid plasma transport controls");
-    PARTHENON_REQUIRE(parthenon::IsCoord<parthenon::UniformCartesian>(),
-                      "TN plasma transport currently requires Cartesian coordinates");
+                          std::isfinite(tolerance) && tolerance > 0 && tolerance < 1 &&
+                          std::isfinite(fraction) && fraction > 0 && fraction <= 0.1 &&
+                          ion_fraction >= 0 && ion_fraction <= 1 && limit > 0,
+                      "Invalid plasma transport controls");
+    PARTHENON_REQUIRE(
+        parthenon::IsCoord<parthenon::UniformCartesian>() || spherical_transport,
+        "TN plasma transport requires Cartesian or 1D spherical coordinates");
     pkg->AddParam("plasma_thermalization_energy", cutoff * units::MeV_to_ERG);
     pkg->AddParam("plasma_velocity_tolerance", tolerance);
     pkg->AddParam("plasma_fractional_step", fraction);
@@ -620,26 +668,40 @@ Initialize_impl(ParameterInput *pin, std::string block_name,
     }
   }
 
-  // Swarm and swarm variables
-  Metadata swarm_metadata({Metadata::Provides, Metadata::None});
-  pkg->AddSwarm(alphas_swarm_name, swarm_metadata);
+  // Native swarms require Cartesian mesh coordinates. Spherical CPT owns its storage.
+  // RIOT owns the non-plasma spherical verification path and validates its mesh
+  // and fixed-fluid controls in CPT::spherical::Initialize.
+  PARTHENON_REQUIRE(
+      !spherical_transport || pkg->Param<bool>("tn_plasma") ||
+          (allow_compact_tallies &&
+           pkg->Param<std::string>("stopping_power_model") == "constant" &&
+           (source_strategy == SourceStrategy::point ||
+            source_strategy == SourceStrategy::isotropic)),
+      "Spherical CPT requires tn_plasma or RIOT constant-stopping point/isotropic verification");
+  if (!spherical_transport) {
+    // Swarm and swarm variables
+    Metadata swarm_metadata({Metadata::Provides, Metadata::None});
+    pkg->AddSwarm(alphas_swarm_name, swarm_metadata);
 
-  Metadata mreal({Metadata::Real, Metadata::Independent});
-  pkg->AddSwarmValue(particle::alphas::time::name(), alphas_swarm_name, mreal);
-  pkg->AddSwarmValue(particle::alphas::weight::name(), alphas_swarm_name, mreal);
-  pkg->AddSwarmValue(particle::alphas::energy::name(), alphas_swarm_name, mreal);
+    Metadata mreal({Metadata::Real, Metadata::Independent});
+    pkg->AddSwarmValue(particle::alphas::time::name(), alphas_swarm_name, mreal);
+    pkg->AddSwarmValue(particle::alphas::weight::name(), alphas_swarm_name, mreal);
+    pkg->AddSwarmValue(particle::alphas::energy::name(), alphas_swarm_name, mreal);
 
-  Metadata mrealv({Metadata::Real, Metadata::Vector, Metadata::Independent}, std::vector<int>{3});
-  pkg->AddSwarmValue(particle::alphas::v::name(), alphas_swarm_name, mrealv);
-  Metadata mintv({Metadata::Integer, Metadata::Vector, Metadata::Independent}, std::vector<int>{3});
-  pkg->AddSwarmValue(particle::alphas::ijk::name(), alphas_swarm_name, mintv);
+    Metadata mrealv({Metadata::Real, Metadata::Vector, Metadata::Independent},
+                    std::vector<int>{3});
+    pkg->AddSwarmValue(particle::alphas::v::name(), alphas_swarm_name, mrealv);
+    Metadata mintv({Metadata::Integer, Metadata::Vector, Metadata::Independent},
+                   std::vector<int>{3});
+    pkg->AddSwarmValue(particle::alphas::ijk::name(), alphas_swarm_name, mintv);
+  }
 
   // Sourcing fields
   // Tallies are local cell accumulators; particle migration carries the particle
   // state, not ghost tally values. Persistent totals still transfer on remeshing.
   Metadata m_onecopy({Metadata::Cell, Metadata::OneCopy});
-  Metadata m_accum({Metadata::Cell, Metadata::OneCopy, Metadata::Restart,
-                    Metadata::ForceRemeshComm});
+  Metadata m_accum(
+      {Metadata::Cell, Metadata::OneCopy, Metadata::Restart, Metadata::ForceRemeshComm});
   Metadata m_vector_accum({Metadata::Cell, Metadata::Vector, Metadata::OneCopy,
                           Metadata::Restart, Metadata::ForceRemeshComm},
                          std::vector<int>{3});
@@ -720,6 +782,7 @@ Real EstimateTimestepMesh(MeshData<Real> *md) {
 //! \brief Fill instantaneous output-only alpha diagnostics immediately before output. Purely diagnostic
 void PrepareTransportOutput(Mesh *pmesh, [[maybe_unused]] ParameterInput *pin,
                             [[maybe_unused]] SimTime &tm) {
+  if (pmesh->packages.Get("charon")->Param<bool>("spherical_transport")) return;
   namespace fj = field::charon;
   namespace pa = particle::alphas;
   namespace sp = swarm_position;
@@ -805,7 +868,7 @@ void PrepareTransportOutput(Mesh *pmesh, [[maybe_unused]] ParameterInput *pin,
         }
       });
     }
-  }
+}
 
 //----------------------------------------------------------------------------------------
 //! \fn  void ResetTransportOutputTallies
@@ -1154,6 +1217,8 @@ TaskStatus EvaluateRadiationEnergy(T *md) {
 //! \brief Initialize radiation based on material temperature and either thermal or
 //!        zero initial radiation.
 void InitializeRadiation(MeshBlockData<Real> *mbd) {
+  if (mbd->GetBlockPointer()->packages.Get("charon")->Param<bool>("spherical_transport"))
+    return;
   auto *pmb = mbd->GetBlockPointer();
   auto &cpt_pkg = mbd->GetBlockPointer()->packages.Get("charon");
   charon::SourceAlphas(mbd, 0.0, 0.0);

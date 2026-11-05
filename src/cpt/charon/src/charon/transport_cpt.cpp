@@ -138,6 +138,7 @@ TaskStatus TransportAlphasImpl(MeshData<Real> *md, const Real t_start, const Rea
   const auto jb = md->GetBoundsJ(IndexDomain::interior);
   const auto kb = md->GetBoundsK(IndexDomain::interior);
   const Real end = t_start + dt;
+  const auto periodic = cpt_pkg->Param<ParticlePeriodicBoundaries>("particle_periodic_boundaries");
 
   parthenon::par_for(
       DEFAULT_LOOP_PATTERN, "TransportCPT", DevExecSpace(), 0, ppack_r.GetMaxFlatIndex(),
@@ -155,9 +156,12 @@ TaskStatus TransportAlphasImpl(MeshData<Real> *md, const Real t_start, const Rea
         int &ip = ppack_i(b, pa::ijk(0), n), &jp = ppack_i(b, pa::ijk(1), n),
             &kp = ppack_i(b, pa::ijk(2), n);
         const auto outside_global = [&]() {
-          return x < swarm_d.x_min_global_ || x >= swarm_d.x_max_global_ ||
-                 (multi_d && (y < swarm_d.y_min_global_ || y >= swarm_d.y_max_global_)) ||
-                 (three_d && (z < swarm_d.z_min_global_ || z >= swarm_d.z_max_global_));
+          return EscapesNonPeriodicAxis(x, swarm_d.x_min_global_, swarm_d.x_max_global_,
+                                         periodic.inner[0], periodic.outer[0]) ||
+                 (multi_d && EscapesNonPeriodicAxis(y, swarm_d.y_min_global_, swarm_d.y_max_global_,
+                                                    periodic.inner[1], periodic.outer[1])) ||
+                 (three_d && EscapesNonPeriodicAxis(z, swarm_d.z_min_global_, swarm_d.z_max_global_,
+                                                    periodic.inner[2], periodic.outer[2]));
         };
         if (outside_global()) {
           swarm_d.MarkParticleForRemoval(n);

@@ -6,6 +6,7 @@ generated/
 debug/
 analysis/
 riot_venv/
+patches/
 
 # Visualization package files
 .smhist

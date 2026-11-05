@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <math.h>
 #include <units.hpp>
 
@@ -102,6 +103,12 @@ class TemperatureLinearStoppingPower {
 // Multispecies LP and shared continuous-slowing helpers.
 // Gaussian CGS; positive S means loss per unit relative path length [erg/cm].
 // LUMOS equations 30--38. The Coulomb logarithm is used ONCE.
+// Optional location information for a failed channel, with no effect on physics.
+struct LPContext {
+  Real radius = -1, time = -1;
+  int rank = -1, shell = -1, species = -2; // species=-1: electrons; >=0: ion channel
+};
+
 struct PlasmaStopping {
   static constexpr double pi = 3.14159265358979323846;
 
@@ -153,7 +160,7 @@ struct PlasmaStopping {
 
   KOKKOS_INLINE_FUNCTION
   static Real Channel(Real energy, Real density, Real mass, Real charge, Real temperature,
-                      Real inverse_debye_squared) {
+                      Real inverse_debye_squared, LPContext context = {}) {
     using namespace units;
     if (density == 0.0 || charge == 0.0) return 0.0;
     PARTHENON_REQUIRE(energy > 0.0 && density > 0.0 && mass > 0.0 && temperature > 0.0 &&
@@ -163,6 +170,19 @@ struct PlasmaStopping {
     // Maxwellian mean-square relative speed, including background thermal motion.
     const Real relative2 = v2 + 3.0 * KB * temperature / mass;
     const Real log_lambda = CoulombLog(inverse_debye_squared, mass, charge, relative2);
+    if (!(std::isfinite(log_lambda) && log_lambda > 0.0)) {
+      printf("LP channel failure: rank=%d shell=%d species=%d r_cm=%.17e "
+             "segment_time_s=%.17e Erel_MeV=%.17e n_cm-3=%.17e mass_g=%.17e "
+             "Z=%.17e T_K=%.17e inverse_Debye_cm-2=%.17e logLambda=%.17e\n",
+             context.rank, context.shell, context.species, double(context.radius),
+             double(context.time), double(energy / MeV_to_ERG), double(density),
+             double(mass), double(charge), double(temperature),
+             double(inverse_debye_squared), double(log_lambda));
+#if !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) &&                       \
+    !defined(__SYCL_DEVICE_ONLY__)
+      fflush(stdout); // Preserve the failed state in redirected cluster logs.
+#endif
+    }
     PARTHENON_REQUIRE(std::isfinite(log_lambda) && log_lambda > 0.0,
                       "LP outside supported Coulomb-logarithm regime");
     const Real result = Evaluate(v2, density, mass, charge, temperature, log_lambda);
