@@ -107,6 +107,8 @@ class TemperatureLinearStoppingPower {
 struct LPContext {
   Real radius = -1, time = -1;
   int rank = -1, shell = -1, species = -2; // species=-1: electrons; >=0: ion channel
+  // Optional CPU spherical-transport flag: defer logging to the MPI cycle summary.
+  int *expanded_log_used = nullptr;
 };
 
 struct PlasmaStopping {
@@ -132,13 +134,37 @@ struct PlasmaStopping {
 
   KOKKOS_INLINE_FUNCTION
   static Real CoulombLog(Real inverse_debye_squared, Real mass, Real charge,
-                         Real relative_speed_squared, Real projectile_charge = 2.0) {
+                         Real relative_speed_squared, Real projectile_charge = 2.0,
+                         LPContext context = {}) {
     const Real reduced_mass = MALPHA * mass / (MALPHA + mass);
     const Real classical = std::abs(projectile_charge * charge) * Q * Q /
                            (reduced_mass * relative_speed_squared);
     const Real quantum = HBAR / (2.0 * reduced_mass * std::sqrt(relative_speed_squared));
     const Real rmin = std::max(classical, quantum);
-    return std::log(1.0 / (std::sqrt(inverse_debye_squared) * rmin));
+    const Real log_lambda =
+        std::log(1.0 / (std::sqrt(inverse_debye_squared) * rmin));
+    if (std::isfinite(log_lambda) && log_lambda < 0.0) {
+      // Expanded Coulomb logarithm: 0.5*ln(1 + (bmax/bmin)^2).
+      // For negative log_lambda, exp(2*log_lambda) cannot overflow.
+      // log1p preserves accuracy when bmax/bmin is small. No floor is imposed.
+      const Real expanded = 0.5 * std::log1p(std::exp(2.0 * log_lambda));
+      if (context.expanded_log_used != nullptr) {
+        *context.expanded_log_used = 1;
+      } else {
+        printf("WARNING: Li-Petrasso Coulomb logarithm is negative; using expanded "
+               "Coulomb logarithm. The model may be insufficient in this regime. "
+               "rank=%d shell=%d species=%d r_cm=%.17e segment_time_s=%.17e "
+               "original_logLambda=%.17e expanded_logLambda=%.17e\n",
+               context.rank, context.shell, context.species, double(context.radius),
+               double(context.time), double(log_lambda), double(expanded));
+#if !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) &&                       \
+    !defined(__SYCL_DEVICE_ONLY__)
+        fflush(stdout);
+#endif
+      }
+      return expanded;
+    }
+    return log_lambda;
   }
 
   // Shared LP kernel. Callers supply their background/screening closure; this
@@ -169,7 +195,8 @@ struct PlasmaStopping {
     const Real v2 = 2.0 * energy / MALPHA;
     // Maxwellian mean-square relative speed, including background thermal motion.
     const Real relative2 = v2 + 3.0 * KB * temperature / mass;
-    const Real log_lambda = CoulombLog(inverse_debye_squared, mass, charge, relative2);
+    const Real log_lambda =
+        CoulombLog(inverse_debye_squared, mass, charge, relative2, 2.0, context);
     if (!(std::isfinite(log_lambda) && log_lambda > 0.0)) {
       printf("LP channel failure: rank=%d shell=%d species=%d r_cm=%.17e "
              "segment_time_s=%.17e Erel_MeV=%.17e n_cm-3=%.17e mass_g=%.17e "

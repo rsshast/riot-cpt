@@ -71,6 +71,10 @@ Region::Region(ParameterInput *pin, const std::string &block, const int id,
       has_electron_temp = true;
   }
 
+  PARTHENON_REQUIRE(!(has_electron_temp &&
+      pin->GetOrAddString("ionization", "temperature_mode", "2T") == "1T"),
+      "1T regions must supply the common c_m_temperature, not a separate electron temperature");
+
   // now build the map of material id to list of variables that will be set in init
   // along the way construct the unique string that maps to the correct InitType for each
   // mat

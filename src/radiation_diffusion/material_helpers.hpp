@@ -131,7 +131,6 @@ struct MaterialHelpers {
       ([&] { outputs.scratch(k, j, i) = 0.0; }(), ...);
     });
 
-    using idx_t = typename idx_range_t::inner_idx_t;
     const int nmat = pack.GetSize(b, ccmat::rho());
     auto T = make_var_view(idx_range, pack_temperature, temperature_t());
     for (int m = 0; m < nmat; ++m) {
@@ -142,17 +141,21 @@ struct MaterialHelpers {
       idx_range.TeamBarrier();
       auto rhom = make_var_view(idx_range, pack, cm::rho(m));
       auto rhobarm = make_var_view(idx_range, pack, ccmat::rho(m));
-      RiotLoop::inner(idx_range, [&](const idx_t kji) {
+      RiotLoop::inner(idx_range, [&](const int k, const int j, const int i) {
+        // Split and tabular EOSs require the per-material charge/cache indexer.
+        // Read it from the material pack even when temperature is lagged in a
+        // separate pack (which need not carry material fields).
+        RiotEOS::LambdaIndexerSingleCoord<pack_t> lambda(pack, b, m, k, j, i);
         (
             [&] {
               if constexpr (std::is_same_v<typename output_ts::tag, EgasTag>) {
-                outputs.scratch(kji) +=
-                    rhobarm(kji) *
-                    eosm.InternalEnergyFromDensityTemperature(rhom(kji), T(kji));
+                outputs.scratch(k, j, i) +=
+                    rhobarm(k, j, i) * eosm.InternalEnergyFromDensityTemperature(
+                        rhom(k, j, i), T(k, j, i), lambda);
               } else if constexpr (std::is_same_v<typename output_ts::tag, CvTag>) {
-                outputs.scratch(kji) +=
-                    rhobarm(kji) *
-                    eosm.SpecificHeatFromDensityTemperature(rhom(kji), T(kji));
+                outputs.scratch(k, j, i) +=
+                    rhobarm(k, j, i) * eosm.SpecificHeatFromDensityTemperature(
+                        rhom(k, j, i), T(k, j, i), lambda);
               } else {
                 PARTHENON_FAIL("Unknown type.");
               }

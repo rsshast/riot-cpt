@@ -263,8 +263,10 @@ TaskCollection RiotDriver::RiotStepTasks() {
       // geometric sources, if curvilinear
       auto geom_source = none;
       if (curvilinear) {
+        // Curvilinear viscous stress reads the strain tensor populated by
+        // ComputePlasmaViscousFluxes in this stage.
         geom_source =
-            tl.AddTask(none, Hydro::CalculateGeometricSource, mu0.get(),
+            tl.AddTask(plasma_viscosity_flx, Hydro::CalculateGeometricSource, mu0.get(),
                        hydro_pkg->GetOrAddMeshDataSubset(pmesh, "dudt", i).get());
       }
 
@@ -303,9 +305,9 @@ TaskCollection RiotDriver::RiotStepTasks() {
             tl.AddTask(tn_source, TNBurn::SharedSources, pmdudt_tn, pmdudt_tn, mu0.get());
       }
 
-      // compute ionization sources, if enabled
+      // 1T evolves only total energy; no separate electron PdV source.
       auto ionization_source = none;
-      if (do_ionization) {
+      if (do_ionization && !pmesh->packages.Get("riot")->Param<bool>("one_temperature")) {
         ionization_source =
             tl.AddTask(none, Ionization::CalculateElectronPDVWork, mu0.get(),
                        ion_pkg->GetOrAddMeshDataSubset(pmesh, "dudt", i).get());

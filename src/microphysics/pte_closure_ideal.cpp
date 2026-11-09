@@ -19,6 +19,7 @@
 
 // Riot includes
 #include <array>
+#include <cmath>
 
 #include "eos_riot.hpp"
 #include "ionization/ionization.hpp"
@@ -149,5 +150,112 @@ void Closure::ApplyIdealGasClosure(MeshData<Real> *md, IndexDomain domain) {
           eos_mat.EvaluateDevice(eos_loop);
           idx_range.TeamBarrier();
         }
+      });
+}
+
+// 1T specialization: both supported EOSs obey P = 2 u / 3, even when
+// the IdealElectrons heat capacity depends on the local mean ionization.
+// Thus conserved thermal energy fixes total pressure. Nested bracketed solves
+// recover T and material densities from total-pressure equilibrium and sum(vf)=1.
+void Closure::ApplyOneTemperatureClosure(MeshData<Real> *md, IndexDomain domain) {
+  using parthenon::ParArray1D;
+  namespace cb = cell_variables::cell_averaged::bulk;
+  namespace mat = cell_variables::cell_averaged::mat;
+  namespace cm = cell_variables::material_averaged;
+  auto pm = md->GetParentPointer();
+  auto materials = pm->packages.Get("materials");
+  auto ion = pm->packages.Get("ionization");
+  const auto eos = materials->Param<EOS_Array_t>("d.d.EOS");
+  const auto electrons = materials->Param<EOS_Array_t>("d.d.electron_EOS");
+  const auto map = materials->Param<ParArray1D<int>>("d.EOS_from_matid");
+  const auto nphase = materials->Param<ParArray1D<int>>("d.nphase");
+  const bool full = ion->Param<bool>("fully_ionized");
+  const bool hydrogen = ion->Param<bool>("fully_ionize_hydrogen");
+  auto v = riot::MakePack<mat::rho, mat::volume_fraction, mat::ionization_zbar,
+                         cm::ionization_zbar, cb::internal_energy, cb::pressure,
+                         cb::temperature, cb::electron_temperature>(md);
+  const auto ib = md->GetBoundsI(domain), jb = md->GetBoundsJ(domain),
+             kb = md->GetBoundsK(domain);
+  if (v.GetNBlocks() == 0) return;
+  parthenon::par_for(parthenon::loop_pattern_mdrange_tag, "Close1T", DevExecSpace(),
+      0, v.GetNBlocks()-1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+      KOKKOS_LAMBDA(int b, int k, int j, int i) {
+        const int nm = v.GetSize(b, mat::rho());
+        PARTHENON_REQUIRE(nm <= RiotLimits::MAX_MATERIALS,
+                          "1T material workspace exceeded");
+        Real ci[RiotLimits::MAX_MATERIALS], ce[RiotLimits::MAX_MATERIALS];
+        Real aa[RiotLimits::MAX_MATERIALS], zz[RiotLimits::MAX_MATERIALS];
+        Real cmin = 0, cmax = 0;
+        for (int m = 0; m < nm; ++m) {
+          const int id = v(b, mat::rho(m)).sparse_id;
+          PARTHENON_REQUIRE(nphase(id) == 1, "1T currently requires single-phase materials");
+          const auto &ei = eos(map(id));
+          const auto &ee = electrons(map(id));
+          aa[m] = ei.MeanAtomicMass();
+          zz[m] = ei.MeanAtomicNumber();
+          PARTHENON_REQUIRE(aa[m] == ee.MeanAtomicMass() && zz[m] == ee.MeanAtomicNumber(),
+                            "1T ion and electron EOS atomic properties must match");
+          RiotEOS::LambdaIndexerSimple lambda(1);
+          ci[m] = ei.SpecificHeatFromDensityTemperature(1, 300, lambda);
+          ce[m] = ee.SpecificHeatFromDensityTemperature(1, 300, lambda);
+          const Real rho = v(b, mat::rho(m), k, j, i);
+          cmin += rho * ci[m];
+          cmax += rho * (ci[m] + zz[m] * ce[m]);
+        }
+        if (cmin == 0) {
+          v(b, cb::temperature(), k, j, i) = 1;
+          v(b, cb::electron_temperature(), k, j, i) = 1;
+          v(b, cb::pressure(), k, j, i) = 0;
+          return;
+        }
+        const Real u = v(b, cb::internal_energy(), k, j, i);
+        PARTHENON_REQUIRE(std::isfinite(u) && u > 0,
+                          "1T requires positive finite total thermal energy");
+        const Real pressure = (2.0/3.0) * u;
+        auto material_density = [&](int m, Real t, Real &z) {
+          const Real base = pressure / ((2.0/3.0) * t);
+          Real lo = base / (ci[m] + zz[m] * ce[m]);
+          Real hi = base / ci[m];
+          const bool fully = full || (hydrogen && zz[m] == 1);
+          if (fully) { z = zz[m]; return lo; }
+          for (int it = 0; it < 64; ++it) {
+            const Real rho = 0.5 * (lo + hi);
+            Ionization::ComputeIonizationState(aa[m], zz[m], rho, t, z, false);
+            if (rho * (ci[m] + ce[m] * z) > base) hi = rho;
+            else lo = rho;
+            if (hi - lo < 1.e-12 * hi) break;
+          }
+          const Real rho = 0.5 * (lo + hi);
+          Ionization::ComputeIonizationState(aa[m], zz[m], rho, t, z, false);
+          return rho;
+        };
+        Real lo = u / cmax, hi = u / cmin;
+        for (int it = 0; it < 64; ++it) {
+          const Real t = 0.5 * (lo + hi);
+          Real vf = 0;
+          for (int m = 0; m < nm; ++m) {
+            if (v(b, mat::rho(m), k, j, i) <= 0) continue;
+            Real z;
+            vf += v(b, mat::rho(m), k, j, i) / material_density(m, t, z);
+          }
+          if (vf > 1) hi = t; else lo = t;
+          if (hi - lo < 1.e-12 * hi) break;
+        }
+        const Real t = 0.5 * (lo + hi);
+        Real vf_sum = 0;
+        for (int m = 0; m < nm; ++m) {
+          const Real rho = v(b, mat::rho(m), k, j, i);
+          Real z = 0, vf = 0;
+          if (rho > 0) vf = rho / material_density(m, t, z);
+          v(b, mat::volume_fraction(m), k, j, i) = vf;
+          v(b, cm::ionization_zbar(m), k, j, i) = z;
+          v(b, mat::ionization_zbar(m), k, j, i) = rho * z;
+          vf_sum += vf;
+        }
+        PARTHENON_REQUIRE(std::isfinite(t) && t > 0 && std::abs(vf_sum - 1) < 1.e-9,
+                          "1T total-pressure/temperature closure failed");
+        v(b, cb::temperature(), k, j, i) = t;
+        v(b, cb::electron_temperature(), k, j, i) = t;
+        v(b, cb::pressure(), k, j, i) = pressure;
       });
 }

@@ -242,6 +242,7 @@ void PrepareTNPlasma(MeshData<Real> *md, Real dt, bool burn = true) {
   for (int s = 0; s < zaids.size(); ++s)
     if (zaids[s] == 1) neutron_mass = isotope_masses[s] * amu;
   PARTHENON_REQUIRE(neutron_mass > 0, "DT burn requires neutron mass metadata");
+  const bool one_temperature = pm->packages.Get("riot")->Param<bool>("one_temperature");
   const Real vfmin = pm->packages.Get("hydro")->Param<Real>("vol_frac_thresh");
   auto v = riot::MakePack<
       cb::temperature, cb::electron_temperature, cb::electron_number_density,
@@ -270,7 +271,8 @@ void PrepareTNPlasma(MeshData<Real> *md, Real dt, bool burn = true) {
           rho += v(b, mat::rho(m), k, j, i);
         // Positive vacuum sentinels belong to this adapter, not RIOT's state.
         const Real ti = rho > 0 ? v(b, cb::temperature(), k, j, i) : Real(1);
-        const Real te = rho > 0 ? v(b, cb::electron_temperature(), k, j, i) : Real(1);
+        const Real te = one_temperature ? ti :
+            (rho > 0 ? v(b, cb::electron_temperature(), k, j, i) : Real(1));
         Real ne = 0;
         PARTHENON_REQUIRE(std::isfinite(ti) && ti > 0 && std::isfinite(te) && te > 0 &&
                               std::isfinite(ne) && ne >= 0,
@@ -290,7 +292,7 @@ void PrepareTNPlasma(MeshData<Real> *md, Real dt, bool burn = true) {
         Real produced = 0, alpha_energy = 0, removed_mass = 0, consumed_energy = 0;
         const Real volume = v.GetCoordinates(b).CellVolume(k, j, i);
         Real ion_energy = std::max(Real(0), v(b, cb::internal_energy(), k, j, i) -
-                                             v(b, cb::electron_internal_energy(), k, j, i));
+                                             (one_temperature ? Real(0) : v(b, cb::electron_internal_energy(), k, j, i)));
         int iso_offset = 0, reaction_offset = 0;
         for (int m = 0; m < v.GetSize(b, mat::rho()); ++m) {
           const int id = v(b, mat::rho(m)).sparse_id;
@@ -356,7 +358,7 @@ void PrepareTNPlasma(MeshData<Real> *md, Real dt, bool burn = true) {
                 }
                 PARTHENON_REQUIRE(ea > 0 && en > 0, "Invalid DT product energies");
                 // Tables include relative and pair-CM thermal energy. Remove
-                // their excess over Q once, from the ion thermal reservoir.
+                // their excess over Q once, from the ion (2T) or total (1T) reservoir.
                 const Real input = std::max(Real(0), ea + en - rd.Qval);
                 if (depletion && input > 0)
                   accepted = std::min(accepted, Real(0.99) * ion_energy / input);
@@ -449,6 +451,7 @@ void PrepareTNPlasma(MeshData<Real> *md, Real dt, bool burn = true) {
 
 TaskStatus ApplyPlasmaDeposition(MeshData<Real> *md) {
   const auto pkg = md->GetMeshPointer()->packages.Get("charon");
+  const bool one_temperature = md->GetMeshPointer()->packages.Get("riot")->Param<bool>("one_temperature");
   const auto niso = pkg->Param<ParArray1D<int>>("plasma_material_isotopes");
   const auto helium = pkg->Param<ParArray1D<int>>("plasma_helium_index");
   auto v = riot::MakePack<cb::total_material_energy, cb::electron_internal_energy,
@@ -494,7 +497,8 @@ TaskStatus ApplyPlasmaDeposition(MeshData<Real> *md) {
         }
         const Real energy = v(b, fj::deposited_lab_energy_step(), k, j, i);
         v(b, cb::total_material_energy(), k, j, i) += energy / volume;
-        v(b, cb::electron_internal_energy(), k, j, i) += qe / volume;
+        if (!one_temperature)
+          v(b, cb::electron_internal_energy(), k, j, i) += qe / volume;
         bool momentum_changed = false;
         for (int d = 0; d < 3; ++d) {
           const Real dp = v(b, fj::deposited_momentum_step(d), k, j, i);
@@ -739,7 +743,7 @@ TaskListStatus Step(Mesh *pm, SimTime &tm, const Real dt) {
     }
   }
   if (pkg->Param<bool>("spherical_transport")) {
-    spherical::Step(pm, tm.time, dt);
+    spherical::Step(pm, tm.time, dt, tm.ncycle);
   } else if (!HasCPTWork(pm, dt)) {
     auto scratch = pkg->Param<std::shared_ptr<charon::TransportScratch>>(
         "transport_scratch");

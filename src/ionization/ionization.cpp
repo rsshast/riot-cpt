@@ -50,6 +50,16 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   auto physics = std::make_shared<StateDescriptor>("ionization");
   Params &params = physics->AllParams();
 
+  const bool one_temperature =
+      pin->GetOrAddString("ionization", "temperature_mode", "2T") == "1T";
+  if (one_temperature) {
+    for (const auto *option : {"electron_ion_coupling", "advect_electron_entropy",
+                              "electron_thermal_conduction", "ion_thermal_conduction",
+                              "plasma_viscosity"})
+      PARTHENON_REQUIRE(!pin->GetOrAddBoolean("ionization", option, false),
+                        "1T requires relaxation, entropy advection, conduction and viscosity off");
+  }
+
   // Root find parameters
   const Real Te_root_tol =
       pin->GetOrAddReal("ionization", "root_tol", 1e-8,
@@ -59,6 +69,9 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   // switch for full ionization
   const bool fully_ionized = pin->GetOrAddBoolean("ionization", "fully_ionized", false);
   physics->AddParam("fully_ionized", fully_ionized);
+  // Opt-in hydrogen-isotope override; heavier materials retain mean ionization.
+  physics->AddParam("fully_ionize_hydrogen",
+      pin->GetOrAddBoolean("ionization", "fully_ionize_hydrogen", false));
 
   // switch for using electron entropy advection (assumes ideal electron gas)
   const bool advect_electron_entropy =
@@ -215,12 +228,17 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   // implying the specific energy is specific to ION density!
   Metadata m = Metadata({Metadata::Cell, Metadata::Independent, Metadata::Intensive,
                          Metadata::FillGhost, Metadata::Advected, Metadata::WithFluxes});
+  if (one_temperature)
+    m = Metadata({Metadata::Cell, Metadata::Independent, Metadata::Intensive,
+                  Metadata::FillGhost}); // restart storage; reconstructed from total energy
   physics->AddField<ccbulk::electron_internal_energy>(m);
 
   // electron entropy density s_e is advected with the bulk
   m = Metadata({Metadata::Cell, Metadata::Independent, Metadata::Intensive,
                 Metadata::FillGhost, Metadata::Advected, Metadata::WithFluxes,
                 Metadata::Conserved});
+  if (one_temperature)
+    m = Metadata({Metadata::Cell, Metadata::Derived, Metadata::Intensive, Metadata::OneCopy});
   physics->AddField<ccbulk::electron_entropy>(m);
 
   m = Metadata(
@@ -256,12 +274,12 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   // JMM: Ionization state can be computed after comms
   physics->FillDerivedMesh = FillDerivedIonization;
 
-  physics->UserWorkBeforeLoopMesh = ConvertElectronEnergyToEntropyMesh;
+  if (!one_temperature) physics->UserWorkBeforeLoopMesh = ConvertElectronEnergyToEntropyMesh;
 
   physics->EstimateTimestepMesh = EstimateTimestepMesh;
 
   // Source term dU/dt variables
-  physics->RegisterMeshDataSubset(
+  if (!one_temperature) physics->RegisterMeshDataSubset(
       "dudt",
       RiotUtils::MakePackageDudtRequirements({ccbulk::electron_internal_energy::name()}));
 
@@ -388,6 +406,7 @@ void ComputeFreeElectronNumberDensity(MeshData<Real> *md) {
   auto pm = md->GetParentPointer();
   auto &options = pm->packages.Get("ionization");
   const bool fully_ionized = options->Param<bool>("fully_ionized");
+  const bool fully_ionize_hydrogen = options->Param<bool>("fully_ionize_hydrogen");
 
   // pull out material eos
   auto &materials = pm->packages.Get("materials");
@@ -435,7 +454,7 @@ void ComputeFreeElectronNumberDensity(MeshData<Real> *md) {
             Real zbar = cm_zbar(kji);
             ComputeIonizationState(anuc, znuc, cm_rho(kji),
                                    pv(ccbulk::electron_temperature(), kji), zbar,
-                                   fully_ionized);
+                                   fully_ionized || (fully_ionize_hydrogen && znuc == 1.0));
             cm_zbar(kji) = zbar;
             ccmat_zbar(kji) = ccmat_rho(kji) * zbar;
             ne(kji) = (m == 0) ? (ccmat_zbar(kji) * one_over_mnuc)
@@ -475,6 +494,8 @@ TaskStatus CalculateElectronPDVWork(MeshData<Real> *u0, MeshData<Real> *dudt) {
   const int ndim = pm->ndim;
 
   auto v = riot::MakePack<ccbulk::electron_pressure, ccbulk::face_velocity>(u0);
+  if (pm->packages.Get("riot")->Param<bool>("one_temperature"))
+    return TaskStatus::complete;
   auto dv = riot::MakePack<ccbulk::electron_internal_energy>(dudt);
   const int nblocks = v.GetNBlocks();
 

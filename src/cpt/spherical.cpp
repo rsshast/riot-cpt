@@ -34,6 +34,7 @@ struct State {
   std::mt19937_64 rng;
   // Global round-robin source sequence, identical on every rank.
   unsigned long long source_sequence = 0;
+  int last_lp_warning_cycle = -1;
   std::string checkpoint_directory;
 };
 // Background rows carry physical shell geometry and the existing plasma adapter.
@@ -365,7 +366,8 @@ void SourceParticles(Mesh *pm, BackgroundData &bg, Real start, Real dt) {
   }
 }
 
-void Transport(Mesh *pm, const BackgroundData &bg, Real end, std::vector<Real> &tallies) {
+void Transport(Mesh *pm, const BackgroundData &bg, Real end, std::vector<Real> &tallies,
+               int &expanded_log_used) {
   if (!pm->packages.Get("charon")->Param<bool>("tn_plasma")) {
     TransportVerification(pm, bg, end, tallies);
     return;
@@ -406,7 +408,7 @@ void Transport(Mesh *pm, const BackgroundData &bg, Real end, std::vector<Real> &
       Real qe = 0, qi = thermal ? energy : 0;
       if (!thermal) {
         const charon::LPContext electron_context{Radius(a.x), clock.Time(),
-                                                 Globals::my_rank, s, -1};
+                                                 Globals::my_rank, s, -1, &expanded_log_used};
         if (speed > 0)
           for (auto &d : direction)
             d /= speed;
@@ -775,11 +777,26 @@ void Initialize(ParameterInput *pin, StateDescriptor *pkg) {
   };
 }
 
-void Step(Mesh *pm, Real start, Real dt) {
+void Step(Mesh *pm, Real start, Real dt, int cycle) {
   auto bg = Gather(pm);
   SourceParticles(pm, bg, start, dt);
   std::vector<Real> tallies(bg.Size() * NTally, 0);
-  Transport(pm, bg, start + dt, tallies);
+  int expanded_log_used = 0;
+  Transport(pm, bg, start + dt, tallies, expanded_log_used);
+#ifdef MPI_PARALLEL
+  PARTHENON_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, &expanded_log_used, 1, MPI_INT,
+                                    MPI_MAX, MPI_COMM_WORLD));
+#endif
+  auto state = GetState(pm);
+  if (expanded_log_used && state->last_lp_warning_cycle != cycle) {
+    if (Globals::my_rank == 0) {
+      std::cout << "WARNING: Li-Petrasso encountered a negative Coulomb logarithm; "
+                   "using the expanded Coulomb logarithm. The model may be "
+                   "insufficient in this regime."
+                << " cycle=" << cycle << " time_s=" << start << std::endl;
+    }
+    state->last_lp_warning_cycle = cycle;
+  }
   ActiveTallies(pm, bg, tallies);
   ScatterSelected(pm, bg, tallies);
 }

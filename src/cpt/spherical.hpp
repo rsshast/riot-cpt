@@ -9,6 +9,6 @@
 namespace CPT::spherical {
 // Rank-owned Cartesian histories; no Parthenon swarm is registered or accessed.
 void Initialize(parthenon::ParameterInput *pin, parthenon::StateDescriptor *pkg);
-void Step(parthenon::Mesh *pm, parthenon::Real start, parthenon::Real dt);
+void Step(parthenon::Mesh *pm, parthenon::Real start, parthenon::Real dt, int cycle);
 } // namespace CPT::spherical
 #endif

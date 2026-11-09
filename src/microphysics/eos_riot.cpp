@@ -19,6 +19,7 @@
 
 // riot includes
 #include "eos_riot.hpp"
+#include <cmath>
 
 #define GET(param) pin->GetReal(block_name, #param)
 
@@ -65,6 +66,19 @@ EOS InitializeEOS(ParameterInput *pin, const std::string &block_name, bool is_el
   const Real Abar = pin->GetOrAddReal(block_name, "mean_atomic_mass", 2.0);
   const Real Zbar = pin->GetOrAddReal(block_name, "mean_atomic_number", 1.0);
   singularity::MeanAtomicProperties AZbar(Abar, Zbar);
+
+  if (pin->GetOrAddString("ionization", "temperature_mode", "2T") == "1T") {
+    PARTHENON_REQUIRE(!shift && zsplit == ZSplitting::None,
+                      "1T requires unshifted, unsplit EOSs");
+    PARTHENON_REQUIRE(eos_type == (is_electron ? "IdealElectrons" : "IdealGas"),
+                      "1T requires IdealGas ions and IdealElectrons electrons");
+    PARTHENON_REQUIRE(Abar > 0 && Zbar > 0, "1T requires positive atomic properties");
+    if (!is_electron) {
+      PARTHENON_REQUIRE(std::abs(pin->GetReal(block_name, "Gamma") - 5.0/3.0) < 1.e-12 &&
+                            pin->GetReal(block_name, "Cv") > 0,
+                        "1T requires monatomic ions (Gamma=5/3) with positive Cv");
+    }
+  }
 
   // Parse inputs
   if (eos_type.compare(IdealGas::EosType()) == 0) {

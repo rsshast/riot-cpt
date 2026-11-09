@@ -60,6 +60,7 @@ void FillInteriorDerived(MeshData<Real> *md) {
   auto riot = pm->packages.Get("riot");
   auto materials = pm->packages.Get("materials");
   const bool do_ionization = riot->Param<bool>("do_ionization");
+  const bool one_temperature = riot->Param<bool>("one_temperature");
   const bool use_general_pte = materials->Param<bool>("use_general_pte");
 
   auto v = riot::MakePack<ccmat::rho, ccbulk::rho, ccbulk::momentum, ccbulk::velocity,
@@ -106,7 +107,8 @@ void FillInteriorDerived(MeshData<Real> *md) {
         if (do_ionization) {
           idx_range.TeamBarrier();
           // Need to use ion energy and pressure for PTE
-          Ionization::ConvertEnergyPressureBulkIon<Ionization::ToIon>(idx_range, v, b);
+          if (!one_temperature)
+            Ionization::ConvertEnergyPressureBulkIon<Ionization::ToIon>(idx_range, v, b);
           for (int m = 0; m < nummat; m++) {
             auto pv_sp = RiotLoop::make_sparse_pack_view(idx_range, v, m);
             RiotLoop::inner(idx_range, [&](const auto kji) {
@@ -119,7 +121,9 @@ void FillInteriorDerived(MeshData<Real> *md) {
       });
 
   // Now that material densities and internal energies are set, pass system through PTE
-  if (use_general_pte) {
+  if (one_temperature) {
+    Closure::ApplyOneTemperatureClosure(md, IndexDomain::interior);
+  } else if (use_general_pte) {
     Closure::ApplyMixedCellClosure(md, IndexDomain::interior);
   } else {
     Closure::ApplyIdealGasClosure(md, IndexDomain::interior);
@@ -165,11 +169,15 @@ void PostCommsFillDerived(MeshData<Real> *md) {
       materials->Param<parthenon::ParArray1D<int>>("d.EOS_from_matid");
 
   const bool do_ionization = riot->Param<bool>("do_ionization");
+  const bool one_temperature = riot->Param<bool>("one_temperature");
   EOS_Array_t electron_eos;
   Real Te_root_tol;
+  bool fully_ionized = false, fully_ionize_hydrogen = false;
   if (do_ionization) {
     const auto &ion_pkg = pm->packages.Get("ionization");
     Te_root_tol = ion_pkg->Param<Real>("Te_root_tol");
+    fully_ionized = ion_pkg->Param<bool>("fully_ionized");
+    fully_ionize_hydrogen = ion_pkg->Param<bool>("fully_ionize_hydrogen");
     electron_eos = materials->Param<EOS_Array_t>("d.d.electron_EOS");
   }
 
@@ -179,7 +187,7 @@ void PostCommsFillDerived(MeshData<Real> *md) {
 
   auto v =
       riot::MakePack<ccmat::rho, ccmat::volume_fraction, ccmat::internal_energy,
-                     ccmat::electron_internal_energy, cm::ionization_zbar, cm::rho,
+                     ccmat::electron_internal_energy, ccmat::ionization_zbar, cm::ionization_zbar, cm::rho,
                      cm::sie, cm::temperature, cm::pressure, cm::bulk_modulus,
                      cm::specific_heat, cm::electron_sie, cm::lT_cache, cm::lr_cache,
                      ccbulk::rho, ccbulk::momentum, ccbulk::total_material_energy,
@@ -255,6 +263,17 @@ void PostCommsFillDerived(MeshData<Real> *md) {
               RiotEOS::LambdaIndexerSingle lambda(pv_n, kji);
               const Real rho_val = pv_n(cm::rho(), kji);
               const Real T = pv(ccbulk::temperature(), kji);
+              if (one_temperature && rho_val > 0) {
+                Real z = 0;
+                Ionization::ComputeIonizationState(eosm_c.MeanAtomicMass(),
+                    eosm_c.MeanAtomicNumber(), rho_val, T, z,
+                    fully_ionized || (fully_ionize_hydrogen &&
+                                     eosm_c.MeanAtomicNumber() == 1.0));
+                pv_n(cm::ionization_zbar(), kji) = z;
+                pv_n(ccmat::ionization_zbar(), kji) = pv_n(ccmat::rho(), kji) * z;
+                pv_n(cm::pressure(), kji) =
+                    eosm_c.PressureFromDensityTemperature(rho_val, T, lambda);
+              }
               pv_n(cm::bulk_modulus(), kji) =
                   (rho_val > 0.0)
                       ? eosm_c.BulkModulusFromDensityTemperature(rho_val, T, lambda)
@@ -278,14 +297,39 @@ void PostCommsFillDerived(MeshData<Real> *md) {
 
         if (do_ionization) {
           // NOTE(JMM): Order matters
-          Ionization::ComputeElectronTemperature(idx_range, v, electron_eos,
-                                                 eos_from_matid, Te_root_tol, b, nmat);
+          if (one_temperature) {
+            RiotLoop::inner(idx_range, [&](const auto kji) {
+              pv(ccbulk::electron_temperature(), kji) = pv(ccbulk::temperature(), kji);
+            });
+          } else {
+            Ionization::ComputeElectronTemperature(idx_range, v, electron_eos,
+                                                   eos_from_matid, Te_root_tol, b, nmat);
+          }
           idx_range.TeamBarrier();
 
           // Updates per-mat electron energy and pressure, total pressure, and total bmod
           Ionization::PerMaterialEnergyPressureBmod(idx_range, v, eos, electron_eos,
                                                     eos_from_matid, b, nmat);
           idx_range.TeamBarrier();
+          if (one_temperature) {
+            for (int n = 0; n < nmat; ++n) {
+              const int id = v(b, ccmat::rho(n)).sparse_id;
+              const auto &ee = electron_eos(eos_from_matid(id));
+              auto pn = RiotLoop::make_sparse_pack_view(idx_range, v, n);
+              auto add_cv = [&](const auto &electron) {
+                RiotLoop::inner(idx_range, [&](const auto kji) {
+                  if (pn(cm::rho(), kji) > 0) {
+                    RiotEOS::LambdaIndexerSingle lambda(pn, kji);
+                    pn(cm::specific_heat(), kji) +=
+                        electron.SpecificHeatFromDensityTemperature(
+                            pn(cm::rho(), kji), pv(ccbulk::temperature(), kji), lambda);
+                  }
+                });
+              };
+              ee.EvaluateDevice(add_cv);
+              idx_range.TeamBarrier();
+            }
+          }
         }
 
         // Recompute bulk quantities
@@ -307,6 +351,21 @@ void PostCommsFillDerived(MeshData<Real> *md) {
         }
 
         if (do_ionization) {
+          if (one_temperature) {
+            RiotLoop::inner(idx_range, [&](const auto kji) {
+              pv(ccbulk::pressure(), kji) = (2.0/3.0) * pv(ccbulk::internal_energy(), kji);
+              pv(ccbulk::electron_internal_energy(), kji) = 0;
+            });
+            idx_range.TeamBarrier();
+            for (int n = 0; n < nmat; ++n) {
+              auto pn = RiotLoop::make_sparse_pack_view(idx_range, v, n);
+              RiotLoop::inner(idx_range, [&](const auto kji) {
+                pv(ccbulk::electron_internal_energy(), kji) +=
+                    pn(ccmat::electron_internal_energy(), kji);
+              });
+              idx_range.TeamBarrier();
+            }
+          }
           // Resets bulk pressure and energy to totals, rather than ion-only
           Ionization::ConvertEnergyPressureBulkIon<Ionization::ToTotal>(idx_range, v, b);
 
@@ -339,7 +398,8 @@ void PostCommsFillDerived(MeshData<Real> *md) {
   // Own the source decision here, after the bulk state has been finalized.
   // Replace the source on every fill; never accumulate histories across fills.
   // CPT::HasCPTWork and Charon consume this field without a second temperature test.
-  if (riot->Param<bool>("do_cpt") && !pm->packages.Get("charon")->Param<bool>("tn_plasma")) {
+  if (riot->Param<bool>("do_cpt") &&
+      !pm->packages.Get("charon")->Param<bool>("tn_plasma")) {
     constexpr Real rho_burn = 100.0; // g / cm^3
     constexpr Real histories_per_cell = 100.0;
     const Real temperature_burn =

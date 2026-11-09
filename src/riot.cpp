@@ -102,6 +102,22 @@ Packages_t RiotDriver::ProcessPackages(std::unique_ptr<ParameterInput> &pin) {
   const bool do_tracers =
       pin->GetOrAddBoolean("physics", "tracers", false, "Enable tracer particles");
 
+  const auto temperature_mode = pin->GetOrAddString("ionization", "temperature_mode", "2T");
+  PARTHENON_REQUIRE(temperature_mode == "1T" || temperature_mode == "2T",
+                    "ionization/temperature_mode must be 1T or 2T");
+  const bool one_temperature = temperature_mode == "1T";
+  riot->AddParam("one_temperature", one_temperature);
+  if (one_temperature) {
+    PARTHENON_REQUIRE(do_ionization && do_hydro &&
+                          parthenon::IsCoord<parthenon::UniformSpherical>(),
+                      "1T currently requires ionization, hydro and UniformSpherical");
+    PARTHENON_REQUIRE(!do_multigroup_diffusion && !do_radiation_transport &&
+                          !do_lasers && !do_prescribed_sources && !do_strength && !do_mix,
+                      "1T supports hydro and TN/CPT without additional heating packages");
+    PARTHENON_REQUIRE(!do_tn || (do_cpt && pin->GetOrAddBoolean("charon", "tn_plasma", false)),
+                      "1T TN requires the CPT tn_plasma burn adapter");
+  }
+
   // check for compatibility
   if (do_strength) PARTHENON_REQUIRE(do_hydro, "Strength requires hydro.")
   if (do_mix) PARTHENON_REQUIRE(do_hydro, "Mix requires hydro.")
@@ -181,7 +197,6 @@ Packages_t RiotDriver::ProcessPackages(std::unique_ptr<ParameterInput> &pin) {
     packages.Add(mat_pkg);
     packages.Add(Hydro::Initialize(pin.get(), mat_pkg.get()));
   }
-  //if (do_cpt) packages.Add(CPT::Initialize(pin.get()));
   if (do_cpt) packages.Add(CPT::Initialize(pin.get(), packages.Get("materials").get()));
   if (do_strength)
     packages.Add(Strength::Initialize(pin.get(), packages.Get("materials").get()));

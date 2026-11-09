@@ -196,6 +196,7 @@ parthenon::TaskStatus MultiGroupTasks<temperature>::LocalSolve(
 
   static const auto desc_base =
       parthenon::MakePackDescriptor<temperature, ccbulk::internal_energy, ccbulk::rho,
+                                    cm::ionization_zbar, cm::lr_cache, cm::lT_cache,
                                     ccmat::rho, cm::rho, ccmat::volume_fraction, Egroup,
                                     Fgroup, kappa_cell, kappa_face, dTc, dSdT, face_area,
                                     volume>(md_base.get());
@@ -329,6 +330,7 @@ parthenon::TaskStatus MultiGroupTasks<temperature>::CorrectTotalEnergy(
   static const auto desc_base =
       parthenon::MakePackDescriptor<kappa_face, Fgroup, Egroup, temperature, ccbulk::rho,
                                     internal_energy, ccbulk::total_material_energy,
+                                    cm::ionization_zbar, cm::lr_cache, cm::lT_cache,
                                     ccmat::rho, cm::rho>(md_base.get());
   auto pack_base = desc_base.GetPack(md_base.get());
 
