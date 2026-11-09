@@ -729,6 +729,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin, StateDescriptor
 
 TaskListStatus Step(Mesh *pm, SimTime &tm, const Real dt) {
   auto &pkg = pm->packages.Get("charon");
+  if (pkg->Param<bool>("spherical_transport")) spherical::RestoreInventories(pm);
   if (pkg->Param<bool>("tn_plasma")) {
     for (int p = 0; p < pm->DefaultNumPartitions(); ++p) {
       PrepareTNPlasma(pm->mesh_data.GetOrAdd("base", p).get(), dt);

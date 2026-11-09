@@ -10,6 +10,7 @@
 #include "variables.hpp"
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -18,6 +19,7 @@
 #include <parthenon_mpi.hpp>
 #include <random>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 namespace CPT::spherical {
@@ -36,6 +38,9 @@ struct State {
   unsigned long long source_sequence = 0;
   int last_lp_warning_cycle = -1;
   std::string checkpoint_directory;
+  // Replicated leaf-shell snapshot. These are extensive amounts, not densities;
+  // generic fluid prolongation must not determine their values after regridding.
+  std::vector<Real> inventory_inner, inventory_outer, inventory;
 };
 // Background rows carry physical shell geometry and the existing plasma adapter.
 enum Background { Inner, Outer, Volume, Ur, Ne, Te, Ti, Screening, Source, Birth, Ions };
@@ -172,6 +177,119 @@ BackgroundData Gather(Mesh *pm, bool material = true) {
   for (int l = 0; l < count / stride; ++l)
     bg.local_shell.push_back(inverse[first + l]);
   return bg;
+}
+
+using InventoryFields = parthenon::TypeList<
+    fj::pending_alphas, fj::physical_alphas, fj::sampled_alphas,
+    fj::electron_heat, fj::ion_heat, fj::escaped_alphas, fj::escaped_energy,
+    fj::thermalized_alphas, fj::neutron_mass, fj::neutron_energy,
+    fj::nuclear_mass_defect, fj::pending_alpha_energy>;
+
+// MPI reduction sees each active leaf exactly once. Default mesh partitions are
+// leaf partitions; Gather's tiling check rejects accidental covered-parent input.
+template <bool Write, class... Fields>
+void InventoryIO(Mesh *pm, const BackgroundData &bg, std::vector<Real> &values,
+                 parthenon::TypeList<Fields...>) {
+  constexpr int nf = sizeof...(Fields);
+  if constexpr (!Write) values.assign(bg.Size() * nf, 0);
+  PARTHENON_REQUIRE(values.size() == bg.Size() * nf,
+                    "Invalid spherical CPT inventory array size");
+  std::size_t local = 0;
+  for (int p = 0; p < pm->DefaultNumPartitions(); ++p) {
+    auto md = pm->mesh_data.GetOrAdd("base", p);
+    auto v = riot::MakePack<Fields...>(md.get());
+    const auto ib = md->GetBoundsI(IndexDomain::interior);
+    const int k = md->GetBoundsK(IndexDomain::interior).s;
+    const int j = md->GetBoundsJ(IndexDomain::interior).s;
+    const int ni = ib.e - ib.s + 1, n = v.GetNBlocks() * ni;
+    if (!n) continue;
+    ParArray2D<Real> staging("Spherical CPT inventory", n, nf);
+    auto h = staging.GetHostMirror();
+    if constexpr (Write) {
+      for (int c = 0; c < n; ++c) {
+        const int s = bg.local_shell.at(local++);
+        for (int f = 0; f < nf; ++f) h(c, f) = values[s * nf + f];
+      }
+      staging.DeepCopy(h);
+    }
+    parthenon::par_for("SphericalInventoryIO", 0, n - 1, KOKKOS_LAMBDA(int c) {
+      int f = 0;
+      if constexpr (Write) {
+        ((v(c / ni, Fields(), k, j, ib.s + c % ni) = staging(c, f++)), ...);
+      } else {
+        ((staging(c, f++) = v(c / ni, Fields(), k, j, ib.s + c % ni)), ...);
+      }
+    });
+    if constexpr (!Write) {
+      h = staging.GetHostMirrorAndCopy();
+      for (int c = 0; c < n; ++c) {
+        const int s = bg.local_shell.at(local++);
+        for (int f = 0; f < nf; ++f) values[s * nf + f] = h(c, f);
+      }
+    }
+  }
+  PARTHENON_REQUIRE(local == bg.local_shell.size(),
+                    "Spherical CPT inventory and leaf geometry mappings differ");
+  if constexpr (!Write) Sum(values);
+}
+
+void CaptureInventories(Mesh *pm, const BackgroundData &bg) {
+  if (!pm->packages.Get("charon")->Param<bool>("tn_plasma")) return;
+  auto state = GetState(pm);
+  InventoryIO<false>(pm, bg, state->inventory, InventoryFields{});
+  state->inventory_inner.resize(bg.Size());
+  state->inventory_outer.resize(bg.Size());
+  for (int s = 0; s < bg.Size(); ++s) {
+    state->inventory_inner[s] = bg.Get(s, Inner);
+    state->inventory_outer[s] = bg.Get(s, Outer);
+  }
+}
+
+// Piecewise-constant extensive remap in spherical volume. No physical advection
+// is applied to pending source/cumulative diagnostics; fluid isotopes and ash
+// continue through their existing conservative hydro refinement path.
+void RemapInventories(Mesh *pm, const BackgroundData &bg) {
+  auto state = GetState(pm);
+  if (state->inventory_inner.empty()) {
+    CaptureInventories(pm, bg);
+    return;
+  }
+  const int oldn = state->inventory_inner.size();
+  const int nf = state->inventory.size() / oldn;
+  PARTHENON_REQUIRE(state->inventory_outer.back() == bg.Get(bg.Size()-1, Outer),
+                    "CPT inventory remap requires an unchanged outer boundary");
+  std::vector<Real> mapped(bg.Size() * nf, 0);
+  auto volume = [](Real lo, Real hi) { return (hi-lo)*(hi*hi+hi*lo+lo*lo); };
+  int old = 0;
+  for (int s = 0; s < bg.Size(); ++s) {
+    const Real lo = bg.Get(s, Inner), hi = bg.Get(s, Outer);
+    while (old < oldn && state->inventory_outer[old] <= lo) ++old;
+    for (int o = old; o < oldn && state->inventory_inner[o] < hi; ++o) {
+      const Real left = std::max(lo, state->inventory_inner[o]);
+      const Real right = std::min(hi, state->inventory_outer[o]);
+      if (right <= left) continue;
+      const Real fraction = volume(left, right) /
+          volume(state->inventory_inner[o], state->inventory_outer[o]);
+      for (int f = 0; f < nf; ++f)
+        mapped[s*nf+f] += fraction * state->inventory[o*nf+f];
+    }
+  }
+  for (int f = 0; f < nf; ++f) {
+    Real before = 0, after = 0;
+    for (int o = 0; o < oldn; ++o) before += state->inventory[o*nf+f];
+    for (int s = 0; s < bg.Size(); ++s) after += mapped[s*nf+f];
+    PARTHENON_REQUIRE(std::isfinite(after) &&
+                          std::abs(after-before) <= 1.e-10 * std::max(std::abs(before), Real(1.e-100)),
+                      "Spherical CPT inventory remap failed conservation");
+  }
+  InventoryIO<true>(pm, bg, mapped, InventoryFields{});
+  state->inventory = std::move(mapped);
+  state->inventory_inner.resize(bg.Size());
+  state->inventory_outer.resize(bg.Size());
+  for (int s = 0; s < bg.Size(); ++s) {
+    state->inventory_inner[s] = bg.Get(s, Inner);
+    state->inventory_outer[s] = bg.Get(s, Outer);
+  }
 }
 
 int Locate(const BackgroundData &bg, Real radius) {
@@ -683,12 +801,17 @@ void Save(Mesh *pm, const SimTime &tm) {
 }
 } // namespace
 
+void RestoreInventories(Mesh *pm) {
+  if (!pm->packages.Get("charon")->Param<bool>("tn_plasma")) return;
+  const auto bg = Gather(pm, false);
+  RemapInventories(pm, bg);
+}
+
 void Initialize(ParameterInput *pin, StateDescriptor *pkg) {
   PARTHENON_REQUIRE(pin->GetInteger("parthenon/mesh", "nx2") == 1 &&
                         pin->GetInteger("parthenon/mesh", "nx3") == 1 &&
-                        pin->GetString("parthenon/mesh", "refinement") == "none" &&
                         pin->GetReal("parthenon/mesh", "x1min") == 0,
-                    "Spherical CPT requires a uniform 1D radial mesh starting at zero");
+                    "Spherical CPT requires a full-sphere 1D radial mesh starting at zero");
   PARTHENON_REQUIRE(
       !pkg->Param<bool>("weak_scaling_diagnostics") &&
           pkg->Param<bool>("transport_alphas"),
@@ -762,11 +885,15 @@ void Initialize(ParameterInput *pin, StateDescriptor *pkg) {
     // Native work fields are not checkpointed. Initialize them and refresh
     // census diagnostics without reading an uninitialized plasma background.
     auto bg = Gather(pm, false);
+    // Native checkpoint inventory is already on its saved leaf mesh. A snapshot
+    // is reconstructed on fresh start/restart; no new particle file format.
+    CaptureInventories(pm, bg);
     std::vector<Real> tallies(bg.Size() * NTally, 0);
     ActiveTallies(pm, bg, tallies);
     ScatterSelected(pm, bg, tallies);
   };
   pkg->UserWorkBeforeOutputMesh = [](Mesh *pm, ParameterInput *, SimTime &tm) {
+    RestoreInventories(pm);
     if (pm->packages.Get("charon")->Param<bool>("cpt_diagnostics")) {
       auto bg = Gather(pm, false);
       std::vector<Real> tallies(bg.Size() * NTally, 0);
@@ -799,5 +926,6 @@ void Step(Mesh *pm, Real start, Real dt, int cycle) {
   }
   ActiveTallies(pm, bg, tallies);
   ScatterSelected(pm, bg, tallies);
+  CaptureInventories(pm, bg);
 }
 } // namespace CPT::spherical

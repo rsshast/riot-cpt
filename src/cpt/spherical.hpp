@@ -10,5 +10,8 @@ namespace CPT::spherical {
 // Rank-owned Cartesian histories; no Parthenon swarm is registered or accessed.
 void Initialize(parthenon::ParameterInput *pin, parthenon::StateDescriptor *pkg);
 void Step(parthenon::Mesh *pm, parthenon::Real start, parthenon::Real dt, int cycle);
+// Restore extensive source/accounting fields after a leaf-mesh change, before burn
+// or checkpoint output. Particle trajectories and rank ownership are unchanged.
+void RestoreInventories(parthenon::Mesh *pm);
 } // namespace CPT::spherical
 #endif
