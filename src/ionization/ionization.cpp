@@ -12,6 +12,7 @@
 //========================================================================================
 // This file was made in part with generative AI.
 
+#include <cstdio>
 #include <memory>
 
 #include <ports-of-call/robust_utils.hpp>
@@ -101,6 +102,9 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
       pin->GetOrAddBoolean("ionization", "electron_thermal_conduction", false,
                            "Solve electron thermal diffusion eqution");
   physics->AddParam("electron_thermal_conduction", electron_thermal_conduction);
+  physics->AddParam("conduction_trace",
+      pin->GetOrAddBoolean("ionization", "conduction_trace", false,
+                          "Flush per-rank conduction progress diagnostics."));
   const std::string electron_conductivity_model = pin->GetOrAddString(
       "ionization", "electron_conductivity_model", "spitzer_volume_average_arithmetic",
       std::vector<std::string>{"constant", "spitzer_volume_average_arithmetic",
@@ -688,6 +692,21 @@ parthenon::TaskCollection ConductionStep(Mesh *pmesh, parthenon::SimTime &tm,
     auto &tl = tr[i];
     auto &md_base = pmesh->mesh_data.GetOrAdd("base", i);
 
+    // No extra tasks or synchronization unless diagnostics are requested.
+    const bool trace_enabled = pkg->Param<bool>("conduction_trace");
+    const char *species_name = Species == TransportSpecies::Electron ? "electron" : "ion";
+    auto trace = [&](parthenon::TaskID dependency, const char *stage) {
+      if (!trace_enabled) return dependency;
+      return tl.AddTask(dependency, [species_name, stage, i, dt]() {
+        Kokkos::fence();
+        std::fprintf(stderr,
+                     "[Conduction] rank=%d partition=%d species=%s dt=%.17e %s\n",
+                     parthenon::Globals::my_rank, i, species_name, double(dt), stage);
+        std::fflush(stderr);
+        return TaskStatus::complete;
+      });
+    };
+
     // core container used by solver
     auto &md = pmesh->mesh_data.Add(conduction_base_container, md_base,
                                     parthenon::GetNames<all_vars_tl>());
@@ -696,42 +715,50 @@ parthenon::TaskCollection ConductionStep(Mesh *pmesh, parthenon::SimTime &tm,
     // holds solution
     auto &md_rhs = pmesh->mesh_data.Add(conduction_rhs_container, md, {delta::name()});
 
+    auto begin = trace(none, "begin coefficient/local-state calculation");
     parthenon::TaskID compute_conductivity;
     if constexpr (Species == TransportSpecies::Electron) {
       compute_conductivity =
-          tl.AddTask(none, CalculateElectronThermalDiffusionCoefficient, md_base.get(),
+          tl.AddTask(begin, CalculateElectronThermalDiffusionCoefficient, md_base.get(),
                      md.get(), dt);
     } else {
-      compute_conductivity = tl.AddTask(none, CalculateIonThermalDiffusionCoefficient,
+      compute_conductivity = tl.AddTask(begin, CalculateIonThermalDiffusionCoefficient,
                                         md_base.get(), md.get(), dt);
     }
 
-    auto set_local = tl.AddTask(none, SetLocal<Species>, md_base.get(), md.get());
+    auto set_local = tl.AddTask(begin, SetLocal<Species>, md_base.get(), md.get());
+    auto coefficients_ready = trace(set_local | compute_conductivity,
+                                    "coefficients/local state ready; begin RHS fluxes");
 
     // add flux divergence to rhs
     parthenon::TaskID calc_flux;
     if constexpr (Species == TransportSpecies::Electron) {
-      calc_flux = tl.AddTask(set_local | compute_conductivity,
+      calc_flux = tl.AddTask(coefficients_ready,
                              CalculateRHSFluxes<ccbulk::electron_temperature, D, delta>,
                              md, md_rhs);
     } else {
       calc_flux =
-          tl.AddTask(set_local | compute_conductivity,
+          tl.AddTask(coefficients_ready,
                      CalculateRHSFluxes<ccbulk::temperature, D, delta>, md, md_rhs);
     }
 
     auto zero_rhs = tl.AddTask(
         calc_flux, parthenon::solvers::utils::SetToZero<parthenon::TypeList<delta>>,
         md_rhs);
+    zero_rhs = trace(zero_rhs, "RHS fluxes ready; begin flux correction/divergence");
     auto flx_res = AddFluxContribution<delta>(tl, zero_rhs, md, md_rhs);
+    flx_res = trace(flx_res, "RHS ready; begin solver setup");
 
     // Solve the matrix equation for \delta T = T^{n+1} - T^{n}
     auto init_solve = bicgstab_solver->AddSetupTasks(tl, flx_res, i, pmesh);
+    init_solve = trace(init_solve, "solver setup complete; begin solve");
     auto solve = bicgstab_solver->AddTasks(tl, init_solve, i, pmesh);
+    solve = trace(solve, "solve complete; begin energy update");
 
     // Update electron temperature and energy
     auto update = tl.AddTask(solve, UpdateStateFromConduction<Species>, md_base.get(),
                              md_u.get(), dt);
+    update = trace(update, "energy update complete; begin derived state/boundary exchange");
 
     auto int_derived = tl.AddTask(
         update, parthenon::Update::PreCommFillDerived<MeshData<Real>>, md_base.get());
@@ -743,6 +770,7 @@ parthenon::TaskCollection ConductionStep(Mesh *pmesh, parthenon::SimTime &tm,
         int_derived, tl, mu0, multilevel);
     auto derive =
         tl.AddTask(set_bc, parthenon::Update::FillDerived<MeshData<Real>>, md_base.get());
+    trace(derive, "complete");
   }
 
   return tc;
@@ -820,7 +848,7 @@ TaskStatus CalculateElectronThermalDiffusionCoefficient(MeshData<Real> *md,
               ElectronThermalConductivityModel::SpitzerVolumeAverageHarmonic) {
             RiotLoop::inner(idx_range, [&](const auto kji) {
               const Real ni = rhom(kji) / mi;
-              const Real nem = rhom(kji) * zbarm(kji);
+              const Real nem = ni * zbarm(kji); // electron number density [cm^-3]
               const Real k_mat =
                   SpitzerHarmConductivity(tele(kji), tion(kji), nem, ni, mi, zbarm(kji),
                                           logKind, zbar_floor, ion_number_density_floor);

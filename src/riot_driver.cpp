@@ -12,6 +12,7 @@
 //========================================================================================
 // This file was made in part with generative AI.
 
+#include <cstdio>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -160,9 +161,23 @@ TaskListStatus RiotDriver::Step() {
     if (status != TaskListStatus::complete) return status;
   }
 
+  const bool trace_conduction = do_ionization &&
+      ion_pkg->Param<bool>("conduction_trace");
+  int split_index = 0;
   for (auto &fn : OperatorSplitTasks) {
+    if (trace_conduction) {
+      std::fprintf(stderr, "[SplitStep] rank=%d cycle=%d operator=%d begin\n",
+                   parthenon::Globals::my_rank, int(tm.ncycle), split_index);
+      std::fflush(stderr);
+    }
     status = fn(pmesh, tm, integrator->dt).Execute();
+    if (trace_conduction) {
+      std::fprintf(stderr, "[SplitStep] rank=%d cycle=%d operator=%d returned\n",
+                   parthenon::Globals::my_rank, int(tm.ncycle), split_index);
+      std::fflush(stderr);
+    }
     if (status != TaskListStatus::complete) return status;
+    ++split_index;
   }
 
   status = RiotPostStepTasks().Execute();

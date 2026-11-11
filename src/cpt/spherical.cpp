@@ -41,9 +41,13 @@ struct State {
   // Replicated leaf-shell snapshot. These are extensive amounts, not densities;
   // generic fluid prolongation must not determine their values after regridding.
   std::vector<Real> inventory_inner, inventory_outer, inventory;
+  // Signed changes introduced by census roulette, separate from physical burn,
+  // deposition and escape. Rank-local, checkpointed with the particle census.
+  Real roulette_count_delta = 0, roulette_energy_delta = 0;
+  Vector roulette_momentum_delta{};
 };
 // Background rows carry physical shell geometry and the existing plasma adapter.
-enum Background { Inner, Outer, Volume, Ur, Ne, Te, Ti, Screening, Source, Birth, Ions };
+enum Background { Inner, Outer, Volume, Ur, Ne, Te, Ti, Screening, Source, Birth, SourceWeight, Ions };
 enum Tally {
   Qe,
   Qi,
@@ -81,6 +85,8 @@ void Sum(std::vector<Real> &values) {
 BackgroundData Gather(Mesh *pm, bool material = true) {
   const bool plasma = pm->packages.Get("charon")->Param<bool>("tn_plasma");
   const int ns = plasma ? pm->packages.Get("charon")->Param<int>("plasma_num_species") : 0;
+  const Real source_weight = pm->packages.Get("charon")->Param<Real>("alpha_weight");
+  const bool population = plasma && pm->packages.Get("charon")->Param<bool>("do_population_control");
   BackgroundData bg;
   bg.stride = Ions + 2 * ns;
   const int stride = bg.stride;
@@ -102,12 +108,14 @@ BackgroundData Gather(Mesh *pm, bool material = true) {
           staging(n, Outer) = c.template Xf<X1DIR>(k, j, i + 1);
           staging(n, Volume) = c.CellVolume(k, j, i);
           for (int f = Ur; f < stride; ++f) staging(n, f) = 0;
+          staging(n, SourceWeight) = source_weight;
         });
     if (plasma && material) {
       auto v = riot::MakePack<
           fj::plasma_velocity, fj::plasma_electron_density, fj::plasma_electron_temperature,
           fj::plasma_ion_temperature, fj::plasma_screening, fj::plasma_ion_density,
-          fj::plasma_ion_charge, fj::source_alpha_energy, cb::cpt_alpha_source>(md.get());
+          fj::plasma_ion_charge, fj::source_alpha_energy, cb::cpt_alpha_source,
+          fj::pending_alphas>(md.get());
       parthenon::par_for(
           "GatherSphericalPlasma", 0, nb * ni - 1, KOKKOS_LAMBDA(int n) {
             const int b = n / ni, i = ib.s + n % ni;
@@ -116,8 +124,10 @@ BackgroundData Gather(Mesh *pm, bool material = true) {
             staging(n, Te) = v(b, fj::plasma_electron_temperature(), k, j, i);
             staging(n, Ti) = v(b, fj::plasma_ion_temperature(), k, j, i);
             staging(n, Screening) = v(b, fj::plasma_screening(), k, j, i);
-            staging(n, Source) = v(b, cb::cpt_alpha_source(), k, j, i);
+            staging(n, Source) = population ? v(b, fj::pending_alphas(), k, j, i)
+                                          : v(b, cb::cpt_alpha_source(), k, j, i);
             staging(n, Birth) = v(b, fj::source_alpha_energy(), k, j, i);
+            staging(n, SourceWeight) = source_weight;
             for (int s = 0; s < ns; ++s) {
               staging(n, Ions + 2 * s) = v(b, fj::plasma_ion_density(s), k, j, i);
               staging(n, Ions + 2 * s + 1) = v(b, fj::plasma_ion_charge(s), k, j, i);
@@ -434,13 +444,96 @@ void TransportVerification(Mesh *pm, const BackgroundData &bg, Real end,
   state->particles.resize(survivor);
 }
 
+// Allocate the global birth budget on the replicated shell inventory. Reserve
+// one history per selected source, then distribute the rest by largest remainder.
+// If there are more source shells than slots, retain smaller inventories as
+// pending physical count/energy; nothing is discarded or depleted a second time.
+void AllocateSourcePopulation(Mesh *pm, BackgroundData &bg) {
+  auto pkg = pm->packages.Get("charon");
+  const int target = pkg->Param<int>("target_sourcing_population");
+  std::vector<int> order;
+  for (int s = 0; s < bg.Size(); ++s) {
+    const Real q = bg.Get(s, Source);
+    PARTHENON_REQUIRE(std::isfinite(q) && q >= 0, "Invalid pending alpha population");
+    if (q > 0) order.push_back(s);
+  }
+  std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+    return bg.Get(a, Source) > bg.Get(b, Source);
+  });
+  if (order.size() > static_cast<std::size_t>(target)) order.resize(target);
+  Real total = 0;
+  for (int s : order) total += bg.Get(s, Source);
+  PARTHENON_REQUIRE(std::isfinite(total), "Nonfinite controlled source inventory");
+  std::vector<int> counts(bg.Size(), 0);
+  if (!order.empty()) {
+    const int budget = std::max(static_cast<int>(order.size()),
+        static_cast<int>(std::ceil(std::min(total, Real(target)))));
+    const int extra = budget - order.size();
+    std::vector<std::pair<Real, int>> remainder;
+    int used = 0;
+    for (int s : order) {
+      const Real allocation = extra * (bg.Get(s, Source) / total);
+      const int n = static_cast<int>(std::floor(allocation));
+      counts[s] = 1 + n;
+      used += counts[s];
+      remainder.emplace_back(allocation - n, s);
+    }
+    std::stable_sort(remainder.begin(), remainder.end(), [](const auto &a, const auto &b) {
+      return a.first > b.first;
+    });
+    PARTHENON_REQUIRE(budget-used >= 0 && budget-used <= remainder.size(),
+                      "Invalid source budget apportionment");
+    for (int n = 0; n < budget-used; ++n) ++counts[remainder[n].second];
+  }
+  for (int s = 0; s < bg.Size(); ++s) {
+    const Real physical = bg.Get(s, Source);
+    bg.rows[s*bg.stride+Source] = counts[s];
+    bg.rows[s*bg.stride+SourceWeight] = counts[s] ? physical / counts[s] : 0;
+  }
+}
+
+// Commit actual emitted weight and residual inventory to native fields. This
+// keeps AMR/restart accounting independent of the fixed alpha_weight setting.
+void CommitControlledSource(Mesh *pm, const BackgroundData &bg) {
+  std::size_t local = 0;
+  for (int p = 0; p < pm->DefaultNumPartitions(); ++p) {
+    auto md = pm->mesh_data.GetOrAdd("base", p);
+    auto v = riot::MakePack<cb::cpt_alpha_source, fj::pending_alphas,
+                           fj::pending_alpha_energy, fj::sampled_alphas>(md.get());
+    const auto ib = md->GetBoundsI(IndexDomain::interior);
+    const int k = md->GetBoundsK(IndexDomain::interior).s;
+    const int j = md->GetBoundsJ(IndexDomain::interior).s;
+    const int ni = ib.e-ib.s+1, n = v.GetNBlocks()*ni;
+    if (!n) continue;
+    ParArray2D<Real> data("Controlled alpha source", n, 2);
+    auto h = data.GetHostMirror();
+    for (int c = 0; c < n; ++c) {
+      const int s = bg.local_shell.at(local++);
+      h(c, 0) = bg.Get(s, Source);
+      h(c, 1) = bg.Get(s, Source) * bg.Get(s, SourceWeight);
+    }
+    data.DeepCopy(h);
+    parthenon::par_for("CommitControlledAlphaSource", 0, n-1, KOKKOS_LAMBDA(int c) {
+      const int b = c/ni, i = ib.s+c%ni;
+      v(b, cb::cpt_alpha_source(), k,j,i) = data(c,0);
+      if (data(c,0) > 0) {
+        v(b, fj::sampled_alphas(), k,j,i) += data(c,1);
+        v(b, fj::pending_alphas(), k,j,i) = 0;
+        v(b, fj::pending_alpha_energy(), k,j,i) = 0;
+      }
+    });
+  }
+}
+
 void SourceParticles(Mesh *pm, BackgroundData &bg, Real start, Real dt) {
   if (!pm->packages.Get("charon")->Param<bool>("tn_plasma")) {
     SourceVerification(pm, bg, start, dt);
     return;
   }
   auto state = GetState(pm);
-  const Real weight = pm->packages.Get("charon")->Param<Real>("alpha_weight");
+  auto pkg = pm->packages.Get("charon");
+  const bool population = pkg->Param<bool>("do_population_control");
+  if (population) AllocateSourcePopulation(pm, bg);
   const unsigned long long nranks = Globals::nranks, rank = Globals::my_rank;
   unsigned long long stage_histories = 0;
   for (int s = 0; s < bg.Size(); ++s) {
@@ -450,6 +543,7 @@ void SourceParticles(Mesh *pm, BackgroundData &bg, Real start, Real dt) {
                       "Invalid radial source count");
     const unsigned long long count = source;
     stage_histories += count;
+    const Real weight = bg.Get(s, SourceWeight);
     const auto first = FirstSourceForRank(state->source_sequence, rank, nranks);
     for (auto n = first; n < count; n += nranks) {
       Particle a;
@@ -468,10 +562,10 @@ void SourceParticles(Mesh *pm, BackgroundData &bg, Real start, Real dt) {
     }
     state->source_sequence += count;
   }
+  if (population) CommitControlledSource(pm, bg);
   Real sampled = 0;
   for (int s = 0; s < bg.Size(); ++s)
-    sampled += bg.Get(s, Source) * weight;
-  auto pkg = pm->packages.Get("charon");
+    sampled += bg.Get(s, Source) * bg.Get(s, SourceWeight);
   pkg->UpdateParam<Real>("cumulative_alphas_sourced",
                          pkg->Param<Real>("cumulative_alphas_sourced") + sampled);
   // Background source counts are already global and replicated. Do not sum
@@ -482,6 +576,46 @@ void SourceParticles(Mesh *pm, BackgroundData &bg, Real start, Real dt) {
               << " | Cumulative weighted alphas: "
               << pkg->Param<Real>("cumulative_alphas_sourced") << std::endl;
   }
+}
+
+void RouletteActiveCensus(Mesh *pm, int cycle) {
+  auto pkg = pm->packages.Get("charon");
+  if (!pkg->Param<bool>("tn_plasma") || !pkg->Param<bool>("do_population_control")) return;
+  const Real kill = pkg->Param<Real>("p_roulette")/100;
+  if (kill == 0) return;
+  auto state = GetState(pm);
+  std::vector<Real> stats(7, 0); // before, killed, signed count, lab energy, momentum
+  stats[0] = state->particles.size();
+  std::size_t survivor = 0;
+  for (auto a : state->particles) {
+    const Real old = a.weight;
+    const bool keep = Uniform(*state) >= kill;
+    a.weight = keep ? old/(1-kill) : 0;
+    PARTHENON_REQUIRE(std::isfinite(a.weight), "Roulette survivor weight overflow");
+    const Real delta = a.weight-old;
+    stats[1] += !keep;
+    stats[2] += delta;
+    stats[3] += delta * 0.5 * charon::units::MALPHA * Dot(a.v,a.v);
+    for (int d = 0; d < 3; ++d) stats[4+d] += delta * charon::units::MALPHA * a.v[d];
+    if (keep) state->particles[survivor++] = a;
+  }
+  state->particles.resize(survivor);
+  state->roulette_count_delta += stats[2];
+  state->roulette_energy_delta += stats[3];
+  for (int d = 0; d < 3; ++d) state->roulette_momentum_delta[d] += stats[4+d];
+  Sum(stats);
+  std::vector<Real> cumulative{state->roulette_count_delta, state->roulette_energy_delta,
+      state->roulette_momentum_delta[0], state->roulette_momentum_delta[1],
+      state->roulette_momentum_delta[2]};
+  Sum(cumulative);
+  if (Globals::my_rank == 0 && stats[0] > 0)
+    std::cout << "[Charon Roulette] cycle=" << cycle << " active_before=" << stats[0]
+              << " killed=" << stats[1] << " count_delta=" << stats[2]
+              << " energy_delta_erg=" << stats[3]
+              << " cumulative_count_delta=" << cumulative[0]
+              << " cumulative_energy_delta_erg=" << cumulative[1]
+              << " cumulative_momentum_delta_g_cm_s=" << cumulative[2] << ","
+              << cumulative[3] << "," << cumulative[4] << std::endl;
 }
 
 void Transport(Mesh *pm, const BackgroundData &bg, Real end, std::vector<Real> &tallies,
@@ -673,13 +807,14 @@ void Scatter(Mesh *pm, const BackgroundData &bg, const std::vector<Real> &tallie
     const int k = md->GetBoundsK(IndexDomain::interior).s;
     const int ni = ib.e - ib.s + 1, nb = geometry.GetNBlocks();
     if (nb == 0) continue;
-    ParArray2D<Real> staging("Spherical CPT reduced tallies", nb * ni, NTally + 1);
+    ParArray2D<Real> staging("Spherical CPT reduced tallies", nb * ni, NTally + 2);
     auto h = staging.GetHostMirror();
     for (int n = 0; n < nb * ni; ++n) {
       const int s = bg.local_shell.at(local++);
       for (int f = 0; f < NTally; ++f)
         h(n, f) = tallies[s * NTally + f];
       h(n, NTally) = bg.Get(s, Source);
+      h(n, NTally+1) = bg.Get(s, Source) * bg.Get(s, SourceWeight);
     }
     staging.DeepCopy(h);
     if (!active_only && pm->packages.Get("charon")->Param<bool>("tn_plasma")) {
@@ -710,7 +845,6 @@ void Scatter(Mesh *pm, const BackgroundData &bg, const std::vector<Real> &tallie
                                  fj::active_ke_tally, fj::source_num_per_cell,
                                  fj::source_ew_per_cell, fj::spower_sum, fj::spower_count,
                                  fj::spower_tally>(md.get());
-      const Real weight = pm->packages.Get("charon")->Param<Real>("alpha_weight");
       parthenon::par_for(
           "SphericalCPTDiagnostics", 0, nb * ni - 1, KOKKOS_LAMBDA(int n) {
             const int b = n / ni, i = ib.s + n % ni;
@@ -719,7 +853,7 @@ void Scatter(Mesh *pm, const BackgroundData &bg, const std::vector<Real> &tallie
             diag(b, fj::active_ke_tally(), k, j, i) = staging(n, ActiveEnergy);
             if (!active_only) {
               diag(b, fj::source_num_per_cell(), k, j, i) = staging(n, NTally);
-              diag(b, fj::source_ew_per_cell(), k, j, i) = staging(n, NTally) * weight;
+              diag(b, fj::source_ew_per_cell(), k, j, i) = staging(n, NTally+1);
               diag(b, fj::spower_sum(), k, j, i) += staging(n, StopSum);
               diag(b, fj::spower_count(), k, j, i) += staging(n, StopCount);
             }
@@ -779,10 +913,13 @@ void Save(Mesh *pm, const SimTime &tm) {
   const auto temporary = target.string() + ".tmp";
   std::ofstream out(temporary);
   out << std::setprecision(std::numeric_limits<Real>::max_digits10);
-  out << "RIOT_SPHERICAL_CPT_V1 " << Globals::nranks << ' ' << Globals::my_rank << ' '
+  out << "RIOT_SPHERICAL_CPT_V2 " << Globals::nranks << ' ' << Globals::my_rank << ' '
       << tm.ncycle << ' ' << tm.time << ' ' << state->source_sequence << ' '
       << state->particles.size() << '\n'
       << state->rng << '\n';
+  out << state->roulette_count_delta << ' ' << state->roulette_energy_delta;
+  for (auto p : state->roulette_momentum_delta) out << ' ' << p;
+  out << '\n';
   for (const auto &a : state->particles) {
     for (auto x : a.x)
       out << x << ' ';
@@ -859,12 +996,21 @@ void Initialize(ParameterInput *pin, StateDescriptor *pkg) {
       Real time = -1;
       std::size_t count = 0;
       in >> magic >> ranks >> rank >> cycle >> time >> state->source_sequence >> count;
-      PARTHENON_REQUIRE(in.good() && magic == "RIOT_SPHERICAL_CPT_V1" &&
+      PARTHENON_REQUIRE(in.good() && (magic == "RIOT_SPHERICAL_CPT_V1" ||
+                                    magic == "RIOT_SPHERICAL_CPT_V2") &&
                             ranks == Globals::nranks && rank == Globals::my_rank &&
                             cycle == tm.ncycle && time == tm.time,
                         "Missing/incompatible spherical CPT companion checkpoint; "
                         "restore its directory and use the original MPI rank count");
       in >> state->rng;
+      if (magic == "RIOT_SPHERICAL_CPT_V2") {
+        in >> state->roulette_count_delta >> state->roulette_energy_delta;
+        for (auto &p : state->roulette_momentum_delta) in >> p;
+        PARTHENON_REQUIRE(in.good() && std::isfinite(state->roulette_count_delta) &&
+                              std::isfinite(state->roulette_energy_delta) &&
+                              std::isfinite(Radius(state->roulette_momentum_delta)),
+                          "Invalid checkpoint roulette accounting");
+      }
       state->particles.resize(count);
       for (auto &a : state->particles) {
         for (auto &x : a.x)
@@ -905,6 +1051,9 @@ void Initialize(ParameterInput *pin, StateDescriptor *pkg) {
 }
 
 void Step(Mesh *pm, Real start, Real dt, int cycle) {
+  // Existing census only. Newborns are sourced after this pass and first become
+  // eligible on the following timestep; roulette never changes physical burn.
+  RouletteActiveCensus(pm, cycle);
   auto bg = Gather(pm);
   SourceParticles(pm, bg, start, dt);
   std::vector<Real> tallies(bg.Size() * NTally, 0);

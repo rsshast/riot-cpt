@@ -135,18 +135,24 @@ FluxMultiplyMatrix(std::shared_ptr<parthenon::MeshData<Real>> &md_in,
                coords.template FaceArea<X1DIR>(k, j, i) *
                    pack_in.flux(b, X1DIR, var_t(), k, j, i)) *
               one_over_vol;
-          pack_out(b, var_t(), k, j, i) +=
-              (coords.template FaceArea<X2DIR>(k, j + (ndim > 1), i) *
-                   pack_in.flux(b, X2DIR, var_t(), k, j + (ndim > 1), i) -
+          // Inactive directions have no computed fluxes. Do not read them even
+          // when their geometric contribution would cancel or be multiplied by zero.
+          if (ndim > 1) {
+            pack_out(b, var_t(), k, j, i) +=
+              (coords.template FaceArea<X2DIR>(k, j + 1, i) *
+                   pack_in.flux(b, X2DIR, var_t(), k, j + 1, i) -
                coords.template FaceArea<X2DIR>(k, j, i) *
                    pack_in.flux(b, X2DIR, var_t(), k, j, i)) *
               one_over_vol;
-          pack_out(b, var_t(), k, j, i) +=
-              (coords.template FaceArea<X3DIR>(k + (ndim > 2), j, i) *
-                   pack_in.flux(b, X3DIR, var_t(), k + (ndim > 2), j, i) -
+          }
+          if (ndim > 2) {
+            pack_out(b, var_t(), k, j, i) +=
+              (coords.template FaceArea<X3DIR>(k + 1, j, i) *
+                   pack_in.flux(b, X3DIR, var_t(), k + 1, j, i) -
                coords.template FaceArea<X3DIR>(k, j, i) *
                    pack_in.flux(b, X3DIR, var_t(), k, j, i)) *
               one_over_vol;
+          }
         });
       });
   return TaskStatus::complete;
@@ -220,22 +226,26 @@ class LinearizedDiffusionEquation {
                                   coords.template FaceArea<X1DIR>(k, j, i + 1) /
                                   coords.template Dxc<X1DIR>(k, j, i + 1)) /
                              coords.CellVolume(k, j, i);
-            diag_elem += (ndim > 1) *
+            if (ndim > 1) {
+              diag_elem +=
                          (pack_mat(b, TE::F2, D(), k, j, i) *
                               coords.template FaceArea<X2DIR>(k, j, i) /
                               coords.template Dxc<X2DIR>(k, j, i) +
-                          pack_mat(b, TE::F2, D(), k, j + (ndim > 1), i) *
-                              coords.template FaceArea<X2DIR>(k, j + (ndim > 1), i) /
-                              coords.template Dxc<X2DIR>(k, j + (ndim > 1), i)) /
+                          pack_mat(b, TE::F2, D(), k, j + 1, i) *
+                              coords.template FaceArea<X2DIR>(k, j + 1, i) /
+                              coords.template Dxc<X2DIR>(k, j + 1, i)) /
                          coords.CellVolume(k, j, i);
-            diag_elem += (ndim > 2) *
+            }
+            if (ndim > 2) {
+              diag_elem +=
                          (pack_mat(b, TE::F3, D(), k, j, i) *
                               coords.template FaceArea<X3DIR>(k, j, i) /
                               coords.template Dxc<X3DIR>(k, j, i) +
-                          pack_mat(b, TE::F3, D(), k + (ndim > 2), j, i) *
-                              coords.template FaceArea<X3DIR>(k + (ndim > 2), j, i) /
-                              coords.template Dxc<X3DIR>(k + (ndim > 2), j, i)) /
+                          pack_mat(b, TE::F3, D(), k + 1, j, i) *
+                              coords.template FaceArea<X3DIR>(k + 1, j, i) /
+                              coords.template Dxc<X3DIR>(k + 1, j, i)) /
                          coords.CellVolume(k, j, i);
+            }
             pout(var_t(), k, j, i) = pack_mat(b, diag_loc(), k, j, i) + diag_elem;
           });
         });

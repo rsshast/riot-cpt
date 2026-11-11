@@ -88,16 +88,26 @@ void InitializeTNPlasma(ParameterInput *pin, StateDescriptor *pkg,
                     "tn_depletion requires do_feedback=true; disable depletion for "
                     "a prescribed-background transport study");
   pkg->AddParam("tn_depletion", depletion);
+  const bool population = pkg->Param<bool>("do_population_control");
+  PARTHENON_REQUIRE(!population || pkg->Param<bool>("spherical_transport"),
+                    "TN plasma population control currently requires spherical CPT");
+  const int target = pin->GetOrAddInteger("charon", "target_sourcing_population", 5000);
+  const Real roulette = pin->GetOrAddReal("charon", "p_roulette", 0.0);
+  PARTHENON_REQUIRE(target > 0 && std::isfinite(roulette) && roulette >= 0 && roulette < 100,
+                    "Require target_sourcing_population > 0 and 0 <= p_roulette < 100 (percent killed)");
+  PARTHENON_REQUIRE(population || roulette == 0,
+                    "p_roulette requires do_population_control=true in TN plasma mode");
+  pkg->AddParam("target_sourcing_population", target);
+  pkg->AddParam("p_roulette", roulette);
   PARTHENON_REQUIRE(
       !pin->GetOrAddBoolean("ionization", "advect_electron_entropy", false),
       "tn_plasma currently requires electron-energy advection, not entropy advection");
   PARTHENON_REQUIRE(
-      !pkg->Param<bool>("do_population_control") &&
-          !pkg->Param<bool>("tally_mass_momentum") &&
+      !pkg->Param<bool>("tally_mass_momentum") &&
           pkg->Param<charon::SourceStrategy>("source_strategy") ==
               charon::SourceStrategy::qfield &&
           pkg->Param<std::string>("alpha_source_mode") == "total",
-      "tn_plasma requires qfield/total, no population control or legacy "
+      "tn_plasma requires qfield/total, no legacy "
       "tally_mass_momentum; plasma uses its own conservative deposition fields");
   PARTHENON_REQUIRE(pkg->Param<Real>("alpha_source_physical_cap") ==
                         std::numeric_limits<Real>::max(),
@@ -228,6 +238,7 @@ void PrepareTNPlasma(MeshData<Real> *md, Real dt, bool burn = true) {
   const int ns = pkg->Param<int>("plasma_num_species");
   const bool depletion = pkg->Param<bool>("tn_depletion");
   const Real weight = pkg->Param<Real>("alpha_weight");
+  const bool population = pkg->Param<bool>("do_population_control");
   PARTHENON_REQUIRE(std::isfinite(weight) && weight > 0, "Invalid physical alpha weight");
   const bool clamp = pkg->Param<bool>("tn_clamp_upper");
   const auto nreactions = tn->Param<ParArray1D<int>>("num_reactions_per_mat");
@@ -432,7 +443,11 @@ void PrepareTNPlasma(MeshData<Real> *md, Real dt, bool burn = true) {
               ? (pending_energy + alpha_energy) / available : charon::units::E0;
           PARTHENON_REQUIRE(std::isfinite(birth_energy) && birth_energy > 0,
                             "Invalid alpha birth energy");
-          const Real count = charon::SourceHistoryCount(produced, weight, pending);
+          // Controlled sourcing allocates a GLOBAL history budget after gathering
+          // physical inventory. Do not consume it using the fixed-weight rule.
+          Real count = 0;
+          if (population) pending = available;
+          else count = charon::SourceHistoryCount(produced, weight, pending);
           pending_energy = pending * birth_energy;
           const int ncells = (ib.e - ib.s + 1) * (jb.e - jb.s + 1) * (kb.e - kb.s + 1);
           PARTHENON_REQUIRE(count < INT_MAX / ncells,
