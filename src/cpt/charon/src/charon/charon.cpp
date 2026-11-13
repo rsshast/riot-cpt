@@ -364,6 +364,8 @@ Initialize_impl(ParameterInput *pin, std::string block_name,
   auto pkg = std::make_shared<StateDescriptor>("charon");
   const bool spherical_transport = parthenon::IsCoord<parthenon::UniformSpherical>();
   pkg->AddParam("spherical_transport", spherical_transport);
+  const bool rz_transport = parthenon::IsCoord<parthenon::UniformCylindrical>();
+  pkg->AddParam("rz_transport", rz_transport);
   ParticlePeriodicBoundaries periodic;
   const char *inner_keys[3] = {"ix1_bc", "ix2_bc", "ix3_bc"};
   const char *outer_keys[3] = {"ox1_bc", "ox2_bc", "ox3_bc"};
@@ -388,8 +390,8 @@ Initialize_impl(ParameterInput *pin, std::string block_name,
                           ion_fraction >= 0 && ion_fraction <= 1 && limit > 0,
                       "Invalid plasma transport controls");
     PARTHENON_REQUIRE(
-        parthenon::IsCoord<parthenon::UniformCartesian>() || spherical_transport,
-        "TN plasma transport requires Cartesian or 1D spherical coordinates");
+        parthenon::IsCoord<parthenon::UniformCartesian>() || spherical_transport || rz_transport,
+        "TN plasma transport requires Cartesian, spherical or RZ coordinates");
     pkg->AddParam("plasma_thermalization_energy", cutoff * units::MeV_to_ERG);
     pkg->AddParam("plasma_velocity_tolerance", tolerance);
     pkg->AddParam("plasma_fractional_step", fraction);
@@ -668,7 +670,7 @@ Initialize_impl(ParameterInput *pin, std::string block_name,
     }
   }
 
-  // Native swarms require Cartesian mesh coordinates. Spherical CPT owns its storage.
+  // Native swarms require Cartesian coordinates; spherical/RZ adapters own storage.
   // RIOT owns the non-plasma spherical verification path and validates its mesh
   // and fixed-fluid controls in CPT::spherical::Initialize.
   PARTHENON_REQUIRE(
@@ -678,7 +680,7 @@ Initialize_impl(ParameterInput *pin, std::string block_name,
            (source_strategy == SourceStrategy::point ||
             source_strategy == SourceStrategy::isotropic)),
       "Spherical CPT requires tn_plasma or RIOT constant-stopping point/isotropic verification");
-  if (!spherical_transport) {
+  if (!spherical_transport && !rz_transport) {
     // Swarm and swarm variables
     Metadata swarm_metadata({Metadata::Provides, Metadata::None});
     pkg->AddSwarm(alphas_swarm_name, swarm_metadata);
@@ -782,7 +784,8 @@ Real EstimateTimestepMesh(MeshData<Real> *md) {
 //! \brief Fill instantaneous output-only alpha diagnostics immediately before output. Purely diagnostic
 void PrepareTransportOutput(Mesh *pmesh, [[maybe_unused]] ParameterInput *pin,
                             [[maybe_unused]] SimTime &tm) {
-  if (pmesh->packages.Get("charon")->Param<bool>("spherical_transport")) return;
+  if (pmesh->packages.Get("charon")->Param<bool>("spherical_transport") ||
+      pmesh->packages.Get("charon")->Param<bool>("rz_transport")) return;
   namespace fj = field::charon;
   namespace pa = particle::alphas;
   namespace sp = swarm_position;
@@ -1217,7 +1220,8 @@ TaskStatus EvaluateRadiationEnergy(T *md) {
 //! \brief Initialize radiation based on material temperature and either thermal or
 //!        zero initial radiation.
 void InitializeRadiation(MeshBlockData<Real> *mbd) {
-  if (mbd->GetBlockPointer()->packages.Get("charon")->Param<bool>("spherical_transport"))
+  if (mbd->GetBlockPointer()->packages.Get("charon")->Param<bool>("spherical_transport") ||
+      mbd->GetBlockPointer()->packages.Get("charon")->Param<bool>("rz_transport"))
     return;
   auto *pmb = mbd->GetBlockPointer();
   auto &cpt_pkg = mbd->GetBlockPointer()->packages.Get("charon");

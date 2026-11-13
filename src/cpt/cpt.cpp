@@ -5,6 +5,7 @@
 
 #include "cpt/cpt.hpp"
 #include "cpt/spherical.hpp"
+#include "cpt/rz.hpp"
 
 #include <algorithm>
 #include <climits>
@@ -89,8 +90,8 @@ void InitializeTNPlasma(ParameterInput *pin, StateDescriptor *pkg,
                     "a prescribed-background transport study");
   pkg->AddParam("tn_depletion", depletion);
   const bool population = pkg->Param<bool>("do_population_control");
-  PARTHENON_REQUIRE(!population || pkg->Param<bool>("spherical_transport"),
-                    "TN plasma population control currently requires spherical CPT");
+  PARTHENON_REQUIRE(!population || pkg->Param<bool>("spherical_transport") || pkg->Param<bool>("rz_transport"),
+                    "TN plasma population control requires spherical or RZ CPT");
   const int target = pin->GetOrAddInteger("charon", "target_sourcing_population", 5000);
   const Real roulette = pin->GetOrAddReal("charon", "p_roulette", 0.0);
   PARTHENON_REQUIRE(target > 0 && std::isfinite(roulette) && roulette >= 0 && roulette < 100,
@@ -739,6 +740,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin, StateDescriptor
   pkg->AddField<ccbulk::cpt_alpha_source>(source_metadata);
   InitializeTNPlasma(pin, pkg.get(), materials);
   if (pkg->Param<bool>("spherical_transport")) spherical::Initialize(pin, pkg.get());
+  if (pkg->Param<bool>("rz_transport")) rz::Initialize(pin,pkg.get());
   return pkg;
 }
 
@@ -760,6 +762,8 @@ TaskListStatus Step(Mesh *pm, SimTime &tm, const Real dt) {
   }
   if (pkg->Param<bool>("spherical_transport")) {
     spherical::Step(pm, tm.time, dt, tm.ncycle);
+  } else if (pkg->Param<bool>("rz_transport")) {
+    rz::Step(pm,tm.time,dt,tm.ncycle);
   } else if (!HasCPTWork(pm, dt)) {
     auto scratch = pkg->Param<std::shared_ptr<charon::TransportScratch>>(
         "transport_scratch");
@@ -778,7 +782,7 @@ TaskListStatus Step(Mesh *pm, SimTime &tm, const Real dt) {
   }
 
   *pkg->MutableParam<bool>("inactive_fields_dirty") = true;
-  auto status = pkg->Param<bool>("spherical_transport")
+  auto status = (pkg->Param<bool>("spherical_transport") || pkg->Param<bool>("rz_transport"))
                     ? TaskListStatus::complete
                     : charon::RadiationStep(pm, tm.time, dt).Execute();
   if (status != TaskListStatus::complete) return status;

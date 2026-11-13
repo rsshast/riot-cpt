@@ -18,6 +18,8 @@ set (SRC_LIST
   
   cpt/cpt.cpp
   cpt/cpt.hpp
+  cpt/rz.cpp
+  cpt/rz.hpp
   cpt/spherical.cpp
   cpt/spherical.hpp
 
