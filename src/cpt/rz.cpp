@@ -846,6 +846,13 @@ void Transport(Mesh *pm, const BackgroundData &bg, Real end, std::vector<Real> &
       if(radius>0) { a.x[0]*=target/radius; a.x[1]*=target/radius; }
       if(a.v[2]>0 && bg.Get(s,Zhi)-a.x[2]<=ez) a.x[2]=bg.Get(s,Zhi)+ez;
       if(a.v[2]<0 && a.x[2]-bg.Get(s,Zlo)<=ez) a.x[2]=bg.Get(s,Zlo)-ez;
+      // A plasma domain starting at Z=0 represents the reflected hemisphere.
+      // Reflect after segment deposition so the boundary impulse is not tallied
+      // as stopping in the fluid. Full-domain endcaps still permit escape.
+      if (bg.zmin == 0 && a.x[2] <= bg.zmin) {
+        a.x[2] = bg.zmin + ez;
+        a.v[2] = std::abs(a.v[2]);
+      }
       if(target>=bg.rmax || a.x[2]<=bg.zmin || a.x[2]>=bg.zmax) {
         t[Escape]+=a.weight; t[EscapeEnergy]+=a.weight*final_energy;
         removed=true; break;
@@ -1059,11 +1066,13 @@ void Save(Mesh *pm, const SimTime &tm) {
 
 void Initialize(ParameterInput *pin, StateDescriptor *pkg) {
   const bool plasma=pkg->Param<bool>("tn_plasma");
+  const Real zmin = pin->GetReal("parthenon/mesh", "x2min");
+  const Real zmax = pin->GetReal("parthenon/mesh", "x2max");
+  const bool half_domain = plasma && zmin == 0 && zmax > 0;
   PARTHENON_REQUIRE(pin->GetInteger("parthenon/mesh","nx2")>1 &&
       pin->GetInteger("parthenon/mesh","nx3")==1 && pin->GetReal("parthenon/mesh","x1min")==0 &&
-      pin->GetReal("parthenon/mesh","x2min")<0 &&
-      pin->GetReal("parthenon/mesh","x2max")==-pin->GetReal("parthenon/mesh","x2min"),
-      "RZ CPT requires R>=0 and a full symmetric axial domain");
+      ((zmin < 0 && zmax == -zmin) || half_domain),
+      "RZ CPT requires R>=0 and a full symmetric axial domain or a plasma half-domain Z>=0");
   PARTHENON_REQUIRE(pin->GetReal("parthenon/mesh","x3min")==0 &&
       std::abs(pin->GetReal("parthenon/mesh","x3max")-2*M_PI)<1.e-12,
       "RZ CPT requires a full 2*pi azimuthal extent");
@@ -1084,9 +1093,10 @@ void Initialize(ParameterInput *pin, StateDescriptor *pkg) {
                       "RZ plasma currently requires rz_no_swirl=true");
     PARTHENON_REQUIRE(pin->GetString("parthenon/mesh","ix1_bc")=="reflecting" &&
         pin->GetString("parthenon/mesh","ox1_bc")=="outflow" &&
-        pin->GetString("parthenon/mesh","ix2_bc")=="outflow" &&
+        pin->GetString("parthenon/mesh","ix2_bc")==
+            (half_domain ? "reflecting" : "outflow") &&
         pin->GetString("parthenon/mesh","ox2_bc")=="outflow",
-        "RZ plasma requires reflecting axis and escaping outer cylinder/endcaps");
+        "RZ plasma requires a reflecting axis/equator and escaping outer boundaries");
   }
   PARTHENON_REQUIRE(
       !pkg->Param<bool>("weak_scaling_diagnostics") &&
@@ -1152,20 +1162,33 @@ void Initialize(ParameterInput *pin, StateDescriptor *pkg) {
     auto state = GetState(pm);
     auto bg = Gather(pm, false); // Establish immutable leaf geometry before restart checks.
     if (tm.ncycle != 0 || tm.time != 0) {
-      std::ifstream in(CheckpointPath(*state, tm.ncycle));
+      const auto checkpoint=CheckpointPath(*state, tm.ncycle);
+      std::ifstream in(checkpoint);
+      PARTHENON_REQUIRE(in.is_open(),
+          std::string("Cannot open RZ CPT companion: ")+checkpoint.string()+
+          "; set charon/rz_checkpoint_directory to the matching companion directory");
       std::string magic;
       int ranks = -1, rank = -1, cycle = -1;
       Real time = -1;
       std::size_t count = 0;
       in >> magic >> ranks >> rank >> cycle >> time >> state->source_sequence >> count;
+      std::ostringstream checkpoint_error;
+      checkpoint_error << std::setprecision(std::numeric_limits<Real>::max_digits10)
+          << "Incompatible RZ CPT companion " << checkpoint.string()
+          << ": read format=" << magic << " ranks=" << ranks << " rank=" << rank
+          << " cycle=" << cycle << " time=" << time
+          << "; expected mode=" << (state->static_mesh ? "static plasma V4" :
+              (pm->packages.Get("charon")->Param<bool>("tn_plasma") ? "uniform plasma V2/V3" : "verification V1"))
+          << " ranks=" << Globals::nranks << " rank=" << Globals::my_rank
+          << " cycle=" << tm.ncycle << " time=" << tm.time
+          << "; header_read_ok=" << in.good();
       PARTHENON_REQUIRE(in.good() && (pm->packages.Get("charon")->Param<bool>("tn_plasma")
                             ? (state->static_mesh ? magic=="RIOT_RZ_PLASMA_V4"
                                : (magic=="RIOT_RZ_PLASMA_V2" || magic=="RIOT_RZ_PLASMA_V3"))
                             : magic=="RIOT_RZ_CPT_V1") &&
                             ranks == Globals::nranks && rank == Globals::my_rank &&
                             cycle == tm.ncycle && time == tm.time,
-                        "Missing/incompatible RZ CPT companion checkpoint; "
-                        "restore its directory and use the original MPI rank count");
+                        checkpoint_error.str());
       in >> state->rng;
       if(pm->packages.Get("charon")->Param<bool>("tn_plasma")) {
         int nr,nz,ns; Real r,zlo,zhi,weight,cumulative;

@@ -46,6 +46,10 @@ CalculateFluxes(std::shared_ptr<parthenon::MeshData<Real>> &md_mat,
   auto pack = desc.GetPack(md.get());
   auto pack_mat = desc_mat.GetPack(md_mat.get());
 
+  // On a two-level composite multigrid grid, SparsePack selects only the fine,
+  // active blocks. A rank can therefore have MeshData but no blocks in this pack.
+  if (pack.GetNBlocks() == 0) return TaskStatus::complete;
+
   for (int dim = 0; dim < ndim; ++dim) {
     const auto te = dim == 0 ? TE::F1 : (dim == 1 ? TE::F2 : TE::F3);
     // The diffusion coefficient arrays are cell mem aligned
@@ -94,6 +98,8 @@ FluxMultiplyMatrix(std::shared_ptr<parthenon::MeshData<Real>> &md_mat,
       parthenon::MakePackDescriptor<face_area, DeltaX, volume>(md_mat.get());
   auto pack_mat = desc_mat.GetPack(md_mat.get());
 
+  if (pack_in.GetNBlocks() == 0) return TaskStatus::complete;
+
   using TE = parthenon::TopologicalElement;
   using lt = RiotUtils::LoopType<>;
   auto idx_space = lt::GetIndexSpace(IndexDomain::interior, 0, pack_in.GetNBlocks(),
@@ -140,6 +146,11 @@ CalculateLocalLinear(std::shared_ptr<parthenon::MeshData<Real>> &md_mat,
   auto pack_mat = desc_mat.GetPack(md_mat.get());
   auto pack_in = desc.GetPack(md_in.get());
   auto pack_out = desc.GetPack(md_out.get());
+
+  // GetSizeHost(0, ...) is invalid for an empty selected pack. This occurs on
+  // ranks that own no active fine blocks of a two-level composite grid.
+  if (pack_in.GetNBlocks() == 0) return TaskStatus::complete;
+
   const int ngroup = pack_in.GetSizeHost(0, var_t());
 
   using lt = RiotUtils::LoopType<>;
@@ -187,6 +198,8 @@ CorrectRefinementBoundaryFluxes(std::shared_ptr<parthenon::MeshData<Real>> &md) 
   static const auto desc =
       parthenon::MakePackDescriptor<var_t>(md.get(), {}, {PDOpt::WithFluxes});
   auto pack = desc.GetPack(md.get());
+  if (pack.GetNBlocks() == 0) return TaskStatus::complete;
+
   const std::size_t scratch_size_in_bytes = 0;
   const std::size_t scratch_level = 1;
 
@@ -258,6 +271,8 @@ inline parthenon::TaskStatus Scale(std::shared_ptr<parthenon::MeshData<Real>> &m
   auto desc = parthenon::MakePackDescriptor<var_t>(md.get());
   auto pack = desc.GetPack(md.get());
   auto pack_matrix = desc.GetPack(md_matrix.get());
+  if (pack.GetNBlocks() == 0) return TaskStatus::complete;
+
   IndexRange ib = md->GetBoundsI(IndexDomain::interior);
   IndexRange jb = md->GetBoundsJ(IndexDomain::interior);
   IndexRange kb = md->GetBoundsK(IndexDomain::interior);
@@ -281,6 +296,8 @@ class LinearizedRadiationDiffusionEquation {
                                            bool coarse) {
     using namespace parthenon;
     const int ndim = md->GetMeshPointer()->ndim;
+    const bool reflect_inner_x2 = md->GetMeshPointer()->packages
+        .Get("multigroup_diffusion_package")->Param<bool>("reflect_inner_x2");
 
     std::set<PDOpt> opts{};
     if (coarse) opts.emplace(PDOpt::Coarse);
@@ -295,9 +312,10 @@ class LinearizedRadiationDiffusionEquation {
 
       const int scratch_size_in_bytes = 0;
       const std::size_t scratch_level = 1;
-      // NOTE(): This reflecting boundary is deliberately left as par_for_outer/inner
+      // Homogeneous perturbations are odd at driven faces and even at the
+      // optional inner-X2 symmetry plane. This is left as par_for_outer/inner
       // rather than a RiotLoop abstraction. It iterates the interior boundary layer but
-      // *writes* only the adjacent ghost cell (q(ghost) = -q(interior)), gated per-block
+      // *writes* only the adjacent ghost cell, gated per-block
       // by pack.IsPhysicalBoundary(). RiotLoop::inner's halo has union semantics (it
       // would also revisit the interior cells, which must not be overwritten), and
       // par_for_bndry is a per-MeshBlock helper without pack-level boundary selection --
@@ -331,8 +349,10 @@ class LinearizedRadiationDiffusionEquation {
                                        get_lower(oj, jb), get_upper(oj, jb),
                                        get_lower(oi, ib), get_upper(oi, ib),
                                        [&](const int k, const int j, const int i) {
+                                         const Real sign =
+                                             reflect_inner_x2 && oj == -1 ? 1 : -1;
                                          pack(b, var_t(g), k + ok, j + oj, i + oi) =
-                                             -pack(b, var_t(g), k, j, i);
+                                             sign * pack(b, var_t(g), k, j, i);
                                        });
             }
           });
@@ -369,6 +389,8 @@ class LinearizedRadiationDiffusionEquation {
     static auto desc = parthenon::MakePackDescriptor<var_t>(md_diag.get());
     auto pack = desc.GetPack(md_diag.get());
     auto pack_mat = desc_mat.GetPack(md_mat.get());
+
+    if (pack.GetNBlocks() == 0) return TaskStatus::complete;
 
     using TE = parthenon::TopologicalElement;
     using lt = RiotUtils::LoopType<LoopConstraint::NoGhost>;

@@ -187,6 +187,9 @@ MultiGroup<temperature>::Initialize(ParameterInput *pin, StateDescriptor *materi
       pin->GetOrAddString("diffusion", "boundary_condition", "constant_temperature",
                           {"constant_temperature", "zero_flux", "double_shell"},
                           "Boundary condition for diffusion.");
+  const bool reflect_inner_x2 = pin->GetOrAddBoolean(
+      "diffusion", "reflect_inner_x2", false, "Zero radiation flux at the inner X2 symmetry plane");
+  pkg->AddParam("reflect_inner_x2", reflect_inner_x2);
   if (boundary_condition == "constant_temperature") {
     auto Tbounds = pin->GetOrAddVector<Real>("diffusion", "boundary_T", {1.e5},
                                              "Boundary temperatures.");
@@ -198,8 +201,13 @@ MultiGroup<temperature>::Initialize(ParameterInput *pin, StateDescriptor *materi
         GetRadBC<X1DIR, BCSide::Inner>(constantT_functor(Tbounds[0])));
     pkg->UserBoundaryFunctions[BoundaryFace::outer_x1].push_back(
         GetRadBC<X1DIR, BCSide::Outer>(constantT_functor(Tbounds[1])));
-    pkg->UserBoundaryFunctions[BoundaryFace::inner_x2].push_back(
-        GetRadBC<X2DIR, BCSide::Inner>(constantT_functor(Tbounds[2])));
+    if (reflect_inner_x2) {
+      pkg->UserBoundaryFunctions[BoundaryFace::inner_x2].push_back(
+          GetConstantFluxRadBC<X2DIR, BCSide::Inner>());
+    } else {
+      pkg->UserBoundaryFunctions[BoundaryFace::inner_x2].push_back(
+          GetRadBC<X2DIR, BCSide::Inner>(constantT_functor(Tbounds[2])));
+    }
     pkg->UserBoundaryFunctions[BoundaryFace::outer_x2].push_back(
         GetRadBC<X2DIR, BCSide::Outer>(constantT_functor(Tbounds[3])));
     pkg->UserBoundaryFunctions[BoundaryFace::inner_x3].push_back(
@@ -605,6 +613,8 @@ void MultiGroup<temperature>::MeshPostProblemGenerator(parthenon::Mesh *mesh,
 
   static const auto desc = parthenon::MakePackDescriptor<temperature, Egroup>(md);
   auto pack = desc.GetPack(md);
+
+  if (pack.GetNBlocks() == 0) return;
 
   Multiphysics::FillInteriorDerived(md);
 
