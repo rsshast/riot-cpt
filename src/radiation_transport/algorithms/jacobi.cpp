@@ -564,6 +564,10 @@ TaskCollection JacobiCommit(Mesh *pmesh, const Real dt) {
       auto pte = tl.AddTask(
           feedback,
           [](MeshData<Real> *md) {
+            if (md->GetParentPointer()->packages.Get("riot")->Param<bool>("one_temperature")) {
+              Closure::ApplyOneTemperatureClosure(md, IndexDomain::interior);
+              return TaskStatus::complete;
+            }
             const bool use_general_pte = md->GetParentPointer()
                                              ->packages.Get("materials")
                                              ->Param<bool>("use_general_pte");
@@ -1033,6 +1037,15 @@ TaskStatus ApplyRHS(MeshData<Real> *rbase, MeshData<Real> *rout, MeshData<Real> 
   auto &mat_pkg = pm->packages.Get("materials");
   const auto &eos = mat_pkg->Param<parthenon::ParArray1D<RiotEOS::EOS>>("d.d.EOS");
   const auto &eos_map = mat_pkg->Param<parthenon::ParArray1D<int>>("d.EOS_from_matid");
+  OneTemperatureTransportEOS thermal_eos;
+  thermal_eos.ions = eos;
+  thermal_eos.enabled = pm->packages.Get("riot")->Param<bool>("one_temperature");
+  if (thermal_eos.enabled) {
+    thermal_eos.electrons = mat_pkg->Param<RiotEOS::EOS_Array_t>("d.d.electron_EOS");
+    const auto ionization = pm->packages.Get("ionization");
+    thermal_eos.fully_ionized = ionization->Param<bool>("fully_ionized");
+    thermal_eos.fully_ionize_hydrogen = ionization->Param<bool>("fully_ionize_hydrogen");
+  }
 
   // Packing
   namespace ccbulk = cell_variables::cell_averaged::bulk;
@@ -1100,7 +1113,10 @@ TaskStatus ApplyRHS(MeshData<Real> *rbase, MeshData<Real> *rout, MeshData<Real> 
         const bool success =
             (fixed_temp_rhs ||
              AdvancedTemperature(troot, tbase, verbose, tflr, root_utils, unit_utils, cdt,
-                                 ngroups, fbnd, vb, nmat1, eos, eos_map, vu, b, k, j, i));
+                                 ngroups, fbnd, vb, nmat1, thermal_eos, eos_map, vu, b, k, j, i));
+        PARTHENON_REQUIRE(success || !thermal_eos.enabled,
+                          "1T radiation common-temperature root failed; reduce timestep "
+                          "or increase radiation_transport/troot_max_iter");
         tadv = (success) ? troot : tbase;
 
         // Update the specific intensity

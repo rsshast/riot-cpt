@@ -27,6 +27,7 @@
 // Riot headers
 #include "radiation_transport/angular_grids/geodesic_grid.hpp"
 #include "radiation_transport/angular_grids/latlon_grid.hpp"
+#include "radiation_transport/angular_grids/rz_symmetry.hpp"
 #include "radiation_transport/transport_utils/transport_utils.hpp"
 
 using namespace parthenon::package::prelude;
@@ -152,6 +153,39 @@ inline auto DriveBC() {
 
 } // namespace Drive
 
+namespace RZRadiationBoundary {
+template <bool axis>
+inline void InnerSymmetry(std::shared_ptr<MeshBlockData<Real>> &mbd, bool coarse) {
+  namespace rad = cell_variables::cell_averaged::rad;
+  auto pmb = mbd->GetBlockPointer();
+  const auto pkg = GetRadPackage(pmb->packages);
+  const auto grid = pkg->Param<std::shared_ptr<LatLonGrid>>("latlon_grid");
+  const int nt = grid->ntheta_, np = grid->nphi_;
+  const int na = pkg->Param<int>("nangles"), ng = pkg->Param<int>("ngroups");
+  constexpr auto dir = axis ? X1DIR : X2DIR;
+  const auto &bounds = coarse ? pmb->c_cellbounds : pmb->cellbounds;
+  const int start = Drive::InteriorBounds<dir>(bounds).s;
+  constexpr auto domain = axis ? IndexDomain::inner_x1 : IndexDomain::inner_x2;
+  static auto descriptors = GetBoundaryPackDescriptorMap<rad::intensity>(mbd);
+  auto v = descriptors[coarse].GetPack(mbd.get());
+  if (v.GetMaxNumberOfVars() == 0) return;
+  pmb->par_for_bndry(
+      "RZ-radiation-symmetry", IndexRange{0, 0}, domain,
+      parthenon::TopologicalElement::CC, coarse, false,
+      KOKKOS_LAMBDA(const int &, const int &k, const int &j, const int &i) {
+        const int ir = axis ? 2 * start - 1 - i : i;
+        const int jr = axis ? j : 2 * start - 1 - j;
+        for (int g = 0; g < ng; ++g)
+          for (int a = 0; a < na; ++a) {
+            const int partner = axis ? RZSymmetry::AxisAngle(a, np)
+                                     : RZSymmetry::EquatorAngle(a, nt, np);
+            v(0, rad::intensity(GAI(na, g, a)), k, j, i) =
+                v(0, rad::intensity(GAI(na, g, partner)), k, jr, ir);
+          }
+      });
+}
+} // namespace RZRadiationBoundary
+
 //----------------------------------------------------------------------------------------
 // Shared initialization for the radiation transport BCs (default, drive).
 //----------------------------------------------------------------------------------------
@@ -228,6 +262,38 @@ inline void EnrollRadiationBC(StateDescriptor *rad_pkg, ParameterInput *pin,
   // Enroll custom BC params
   if (drive_bc_enrolled) {
     BCOption::AddDriveParams(pin, params);
+  }
+
+  const bool axis = pin->GetOrAddBoolean("radiation_transport/symmetry", "axis_inner_x1", false);
+  const bool equator = pin->GetOrAddBoolean("radiation_transport/symmetry", "reflect_inner_x2", false);
+  const bool rz = parthenon::IsCoord<parthenon::UniformCylindrical>();
+  const bool one_t = pin->GetOrAddString("ionization", "temperature_mode", "2T") == "1T";
+  const bool half = rz && pin->GetReal("parthenon/mesh", "x2min") == 0;
+  if (rz && one_t) {
+    PARTHENON_REQUIRE(axis && (!half || equator),
+                      "RZ 1T SN requires axis symmetry and equatorial reflection for Z>=0");
+  }
+  if (axis || equator) {
+    PARTHENON_REQUIRE(rz && params.Get<std::string>("angular_mesh") == "latlon",
+                      "RZ radiation symmetry requires a latlon angular mesh");
+    const auto grid = params.Get<std::shared_ptr<LatLonGrid>>("latlon_grid");
+    PARTHENON_REQUIRE(grid->ntheta_ >= 2 && grid->nphi_ >= 2 && grid->nphi_ % 2 == 0,
+                      "RZ radiation symmetry requires ntheta>=2 and even nphi>=2");
+    if (axis) {
+      PARTHENON_REQUIRE(pin->GetReal("parthenon/mesh", "x1min") == 0 &&
+                            pin->GetString("parthenon/mesh", "ix1_bc") == "reflecting" &&
+                            pin->GetOrAddString(drive_block, "ix1_bc", "default") != "drive",
+                        "RZ radiation axis requires Rmin=0, reflecting hydro and no drive");
+      rad_pkg->UserBoundaryFunctions[BoundaryFace::inner_x1].push_back(
+          RZRadiationBoundary::InnerSymmetry<true>);
+    }
+    if (equator) {
+      PARTHENON_REQUIRE(half && pin->GetString("parthenon/mesh", "ix2_bc") == "reflecting" &&
+                            pin->GetOrAddString(drive_block, "ix2_bc", "default") != "drive",
+                        "Radiation equator requires Zmin=0, reflecting hydro and no drive");
+      rad_pkg->UserBoundaryFunctions[BoundaryFace::inner_x2].push_back(
+          RZRadiationBoundary::InnerSymmetry<false>);
+    }
   }
 }
 

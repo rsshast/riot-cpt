@@ -30,7 +30,8 @@ using namespace parthenon::package::prelude;
 
 namespace Closure {
 
-// Monatomic ideal ions + ideal electrons with the configured mean ionization.
+// Matched split ideal-gas surrogates, or monatomic ions + ideal electrons,
+// with the configured mean ionization and one common temperature.
 void ApplyOneTemperatureClosure(MeshData<Real> *md, IndexDomain domain);
 void ApplyMixedCellClosure(MeshData<Real> *md, IndexDomain domain);
 void ApplyIdealGasClosure(MeshData<Real> *md, IndexDomain domain);

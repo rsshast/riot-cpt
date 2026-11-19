@@ -109,11 +109,20 @@ Packages_t RiotDriver::ProcessPackages(std::unique_ptr<ParameterInput> &pin) {
   riot->AddParam("one_temperature", one_temperature);
   if (one_temperature) {
     PARTHENON_REQUIRE(do_ionization && do_hydro &&
-                          parthenon::IsCoord<parthenon::UniformSpherical>(),
-                      "1T currently requires ionization, hydro and UniformSpherical");
-    PARTHENON_REQUIRE(!do_multigroup_diffusion && !do_radiation_transport &&
+                          (parthenon::IsCoord<parthenon::UniformSpherical>() ||
+                           parthenon::IsCoord<parthenon::UniformCylindrical>()),
+                      "1T requires ionization, hydro and spherical or cylindrical coordinates");
+    PARTHENON_REQUIRE(!do_multigroup_diffusion &&
                           !do_lasers && !do_prescribed_sources && !do_strength && !do_mix,
-                      "1T supports hydro and TN/CPT without additional heating packages");
+                      "1T supports hydro, TN/CPT and implicit radiation transport; "
+                      "diffusion and other heating packages are not supported");
+    if (do_radiation_transport) {
+      PARTHENON_REQUIRE(pin->GetOrAddBoolean("radiation_transport", "do_jacobi", false) &&
+                            !pin->GetOrAddBoolean("radiation_transport", "do_explicit", false),
+                        "1T radiation transport requires the implicit Jacobi solver");
+      PARTHENON_REQUIRE(!pin->GetOrAddBoolean("radiation_transport", "fixed_temp_rhs", false),
+                        "1T radiation transport must solve for the common material temperature");
+    }
     PARTHENON_REQUIRE(!do_tn || (do_cpt && pin->GetOrAddBoolean("charon", "tn_plasma", false)),
                       "1T TN requires the CPT tn_plasma burn adapter");
   }
@@ -132,8 +141,8 @@ Packages_t RiotDriver::ProcessPackages(std::unique_ptr<ParameterInput> &pin) {
   PARTHENON_REQUIRE(
       !(do_multigroup_diffusion && do_radiation_transport),
       "Multigroup diffusion and radiation transport cannot both be enabled.")
-  PARTHENON_REQUIRE(!(do_ionization && do_radiation_transport),
-                    "Radiation transport with ionization is not yet supported.")
+  PARTHENON_REQUIRE(!(do_ionization && do_radiation_transport) || one_temperature,
+                    "Radiation transport with ionization requires temperature_mode=1T.")
   if (do_levelsets) PARTHENON_REQUIRE(do_hydro, "Levelsets config. requires hydro.")
   if (do_gravity) PARTHENON_REQUIRE(do_hydro, "Gravity config. requires hydro.")
   if (do_ionization) PARTHENON_REQUIRE(do_hydro, "Ionization requires hydro.");

@@ -68,12 +68,19 @@ EOS InitializeEOS(ParameterInput *pin, const std::string &block_name, bool is_el
   singularity::MeanAtomicProperties AZbar(Abar, Zbar);
 
   if (pin->GetOrAddString("ionization", "temperature_mode", "2T") == "1T") {
-    PARTHENON_REQUIRE(!shift && zsplit == ZSplitting::None,
-                      "1T requires unshifted, unsplit EOSs");
-    PARTHENON_REQUIRE(eos_type == (is_electron ? "IdealElectrons" : "IdealGas"),
-                      "1T requires IdealGas ions and IdealElectrons electrons");
+    PARTHENON_REQUIRE(!shift, "1T requires unshifted EOSs");
+    const bool split_ideal = zsplit != ZSplitting::None && eos_type == "IdealGas";
+    PARTHENON_REQUIRE(split_ideal ||
+                          (zsplit == ZSplitting::None &&
+                           eos_type == (is_electron ? "IdealElectrons" : "IdealGas")),
+                      "1T requires matched split IdealGas EOSs, or unsplit IdealGas "
+                      "ions and IdealElectrons electrons");
     PARTHENON_REQUIRE(Abar > 0 && Zbar > 0, "1T requires positive atomic properties");
-    if (!is_electron) {
+    if (split_ideal) {
+      PARTHENON_REQUIRE(pin->GetReal(block_name, "Gamma") > 1 &&
+                            pin->GetReal(block_name, "Cv") > 0,
+                        "1T split ideal gases require Gamma > 1 and positive Cv");
+    } else if (!is_electron) {
       PARTHENON_REQUIRE(std::abs(pin->GetReal(block_name, "Gamma") - 5.0/3.0) < 1.e-12 &&
                             pin->GetReal(block_name, "Cv") > 0,
                         "1T requires monatomic ions (Gamma=5/3) with positive Cv");

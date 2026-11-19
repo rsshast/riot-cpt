@@ -19,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <tuple>
+#include <type_traits>
 // parthenon infrastructure includes
 #include <parthenon/package.hpp>
 using namespace parthenon::package::prelude;
@@ -74,6 +75,21 @@ static constexpr const auto all_eoses =
 
 using EOS = typename decltype(singularity::tl_to_Variant(impl::all_eoses))::vt;
 using EOS_Array_t = parthenon::ParArray1D<EOS>;
+
+// A split IdealGas represents a partition of one total surrogate, whose Gamma
+// need not be 5/3. Its two channels still share a single temperature in 1T.
+KOKKOS_INLINE_FUNCTION
+bool IsZSplitIdealGas(const EOS &eos, const bool electron) {
+  bool split = false;
+  auto identify = [&](const auto &model) {
+    using Model = typename std::decay<decltype(model)>::type;
+    split = electron
+                ? std::is_same<Model, singularity::ZSplitE<singularity::IdealGas>>::value
+                : std::is_same<Model, singularity::ZSplitI<singularity::IdealGas>>::value;
+  };
+  eos.EvaluateDevice(identify);
+  return split;
+}
 
 class LambdaIndexerSimple {
  public:

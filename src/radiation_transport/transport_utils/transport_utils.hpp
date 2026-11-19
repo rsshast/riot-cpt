@@ -39,7 +39,10 @@
 #include <utils/error_checking.hpp>
 
 // Riot includes
+#include "microphysics/eos_riot.hpp"
+#include "microphysics/one_temperature_energy.hpp"
 #include "radiation_transport/angular_grids/angular_grid_utils.hpp"
+#include "riot_limits.hpp"
 #include "riot_utils/riot_loops.hpp"
 #include "variables.hpp"
 
@@ -526,6 +529,64 @@ InternalEnergy(const Real temp, const int nm1, const EOS eos, const EOSMAP map,
     ubulk += rhob * eosm.InternalEnergyFromDensityTemperature(rhom, temp);
   }
   return ubulk;
+}
+
+// The regular transport EOS array describes ions when ionization is enabled.
+// Supply the full equilibrium thermal reservoir to the Jacobi temperature root,
+// without introducing a separately evolved electron temperature or electron energy.
+struct OneTemperatureTransportEOS {
+  RiotEOS::EOS_Array_t ions, electrons;
+  bool enabled = false;
+  bool fully_ionized = false;
+  bool fully_ionize_hydrogen = false;
+};
+
+template <typename EOSMAP, typename V1>
+KOKKOS_FORCEINLINE_FUNCTION static Real
+InternalEnergy(const Real temp, const int nm1, const OneTemperatureTransportEOS eos,
+               const EOSMAP map, const V1 vu, const int b, const int k,
+               const int j, const int i) {
+  if (!eos.enabled) return InternalEnergy(temp, nm1, eos.ions, map, vu, b, k, j, i);
+  namespace mat = cell_variables::cell_averaged::mat;
+  constexpr int max_materials = RiotLimits::MAX_MATERIALS;
+  PARTHENON_REQUIRE(nm1 + 1 <= max_materials, "1T radiation material workspace exceeded");
+  Real mass[max_materials], ci[max_materials], ce[max_materials];
+  Real aa[max_materials], zz[max_materials];
+  bool full[max_materials];
+  bool any_split = false, any_partial_unsplit = false;
+  for (int m = 0; m <= nm1; ++m) {
+    const int id = map(vu(b, mat::rho(m)).sparse_id);
+    const auto &ion = eos.ions(id);
+    const auto &electron = eos.electrons(id);
+    mass[m] = vu(b, mat::rho(m), k, j, i);
+    aa[m] = ion.MeanAtomicMass();
+    zz[m] = ion.MeanAtomicNumber();
+    RiotEOS::LambdaIndexerSimple lambda(1);
+    ci[m] = ion.SpecificHeatFromDensityTemperature(1, 300, lambda);
+    ce[m] = electron.SpecificHeatFromDensityTemperature(1, 300, lambda);
+    full[m] = eos.fully_ionized || (eos.fully_ionize_hydrogen && zz[m] == 1);
+    const bool split = RiotEOS::IsZSplitIdealGas(ion, false);
+    if (mass[m] > 0) {
+      any_split = any_split || split;
+      any_partial_unsplit = any_partial_unsplit || (!split && !full[m]);
+    }
+    if (split) {
+      // ZSplitI + ZSplitE recover ONE catalog Cv for every mean charge.
+      // Encode that constant total capacity for the common-temperature root.
+      ci[m] += ce[m];
+      ce[m] = 0;
+      full[m] = true;
+    }
+  }
+  PARTHENON_REQUIRE(!any_split || !any_partial_unsplit,
+                    "1T mixed split/unsplit EOSs require fully ionized unsplit materials");
+  auto charge = [&](const int m, const Real rho, const Real temperature) {
+    Real z = 0;
+    Ionization::ComputeIonizationState(aa[m], zz[m], rho, temperature, z, full[m]);
+    return z;
+  };
+  return OneTemperature::InternalEnergyFromTemperature(
+      temp, nm1 + 1, mass, ci, ce, zz, full, charge);
 }
 
 //----------------------------------------------------------------------------------------

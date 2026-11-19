@@ -22,6 +22,7 @@
 #include <cmath>
 
 #include "eos_riot.hpp"
+#include "one_temperature_energy.hpp"
 #include "ionization/ionization.hpp"
 #include "materials/materials.hpp"
 #include "pte_closure.hpp"
@@ -153,10 +154,8 @@ void Closure::ApplyIdealGasClosure(MeshData<Real> *md, IndexDomain domain) {
       });
 }
 
-// 1T specialization: both supported EOSs obey P = 2 u / 3, even when
-// the IdealElectrons heat capacity depends on the local mean ionization.
-// Thus conserved thermal energy fixes total pressure. Nested bracketed solves
-// recover T and material densities from total-pressure equilibrium and sum(vf)=1.
+// Split ideal-gas surrogates preserve their catalog Gamma and total Cv at common T.
+// Unsplit monatomic ions + IdealElectrons retain the partial-ionization closure.
 void Closure::ApplyOneTemperatureClosure(MeshData<Real> *md, IndexDomain domain) {
   using parthenon::ParArray1D;
   namespace cb = cell_variables::cell_averaged::bulk;
@@ -185,6 +184,9 @@ void Closure::ApplyOneTemperatureClosure(MeshData<Real> *md, IndexDomain domain)
                           "1T material workspace exceeded");
         Real ci[RiotLimits::MAX_MATERIALS], ce[RiotLimits::MAX_MATERIALS];
         Real aa[RiotLimits::MAX_MATERIALS], zz[RiotLimits::MAX_MATERIALS];
+        Real mass[RiotLimits::MAX_MATERIALS], capacity[RiotLimits::MAX_MATERIALS];
+        Real pcoef[RiotLimits::MAX_MATERIALS], volume[RiotLimits::MAX_MATERIALS];
+        bool any_split = false, all_constant = true;
         Real cmin = 0, cmax = 0;
         for (int m = 0; m < nm; ++m) {
           const int id = v(b, mat::rho(m)).sparse_id;
@@ -199,6 +201,26 @@ void Closure::ApplyOneTemperatureClosure(MeshData<Real> *md, IndexDomain domain)
           ci[m] = ei.SpecificHeatFromDensityTemperature(1, 300, lambda);
           ce[m] = ee.SpecificHeatFromDensityTemperature(1, 300, lambda);
           const Real rho = v(b, mat::rho(m), k, j, i);
+          mass[m] = rho;
+          const bool split = RiotEOS::IsZSplitIdealGas(ei, false);
+          PARTHENON_REQUIRE(split == RiotEOS::IsZSplitIdealGas(ee, true),
+                            "1T ion and electron EOS splitting must match");
+          if (split) {
+            const Real pi = ei.PressureFromDensityTemperature(1, 300, lambda);
+            const Real pe = ee.PressureFromDensityTemperature(1, 300, lambda);
+            PARTHENON_REQUIRE(std::abs(ci[m] - ce[m]) < 1.e-12 * (ci[m] + ce[m]) &&
+                                  std::abs(pi - pe) < 1.e-12 * (pi + pe),
+                              "1T split ion/electron EOSs must partition the same Cv and Gamma");
+          }
+          RiotEOS::LambdaIndexerSimple equilibrium(zz[m]);
+          capacity[m] = ei.SpecificHeatFromDensityTemperature(1, 300, equilibrium) +
+                        ee.SpecificHeatFromDensityTemperature(1, 300, equilibrium);
+          pcoef[m] = (ei.PressureFromDensityTemperature(1, 300, equilibrium) +
+                      ee.PressureFromDensityTemperature(1, 300, equilibrium)) / 300;
+          if (rho > 0) {
+            any_split = any_split || split;
+            all_constant = all_constant && (split || full || (hydrogen && zz[m] == 1));
+          }
           cmin += rho * ci[m];
           cmax += rho * (ci[m] + zz[m] * ce[m]);
         }
@@ -211,6 +233,29 @@ void Closure::ApplyOneTemperatureClosure(MeshData<Real> *md, IndexDomain domain)
         const Real u = v(b, cb::internal_energy(), k, j, i);
         PARTHENON_REQUIRE(std::isfinite(u) && u > 0,
                           "1T requires positive finite total thermal energy");
+        if (any_split) {
+          PARTHENON_REQUIRE(all_constant,
+                            "1T mixed split/unsplit EOSs require fully ionized unsplit materials");
+          Real t, pressure;
+          OneTemperature::IdealGasMixtureFromEnergy(
+              u, nm, mass, capacity, pcoef, t, pressure, volume);
+          PARTHENON_REQUIRE(std::isfinite(t) && t > 0 &&
+                                std::isfinite(pressure) && pressure > 0,
+                            "1T split ideal-gas equilibrium failed");
+          for (int m = 0; m < nm; ++m) {
+            Real z = 0;
+            if (mass[m] > 0)
+              Ionization::ComputeIonizationState(aa[m], zz[m], mass[m] / volume[m], t, z,
+                  full || (hydrogen && zz[m] == 1));
+            v(b, mat::volume_fraction(m), k, j, i) = volume[m];
+            v(b, cm::ionization_zbar(m), k, j, i) = z;
+            v(b, mat::ionization_zbar(m), k, j, i) = mass[m] * z;
+          }
+          v(b, cb::temperature(), k, j, i) = t;
+          v(b, cb::electron_temperature(), k, j, i) = t;
+          v(b, cb::pressure(), k, j, i) = pressure;
+          return;
+        }
         const Real pressure = (2.0/3.0) * u;
         auto material_density = [&](int m, Real t, Real &z) {
           const Real base = pressure / ((2.0/3.0) * t);
