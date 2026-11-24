@@ -282,6 +282,14 @@ void LatLonGrid::ComputeUnitFluxes(ParArrayHost<Real> &theta_v, ParArrayHost<Rea
     for (int nb = 0; nb < 4; ++nb)
       gflux_h(i, nb) = 0.0;
 
+  // Normalize the azimuthal face difference to the midpoint radial cosine:
+  // sin(phi_hi) - sin(phi_lo) = 2 * sin(dphi/2) * cos(phi_center).
+  // This balances radial streaming for constant intensity. For two bins,
+  // both azimuthal faces have zero flux.
+  const Real half_dphi = M_PI / nphi_;
+  [[maybe_unused]] const Real rz_phi_scale =
+      nphi_ > 2 ? half_dphi / std::sin(half_dphi) : 0.0;
+
   for (int it = 0; it < ntheta_; ++it) {
     for (int ip = 0; ip < nphi_; ++ip) {
       const int idx = it * nphi_ + ip;
@@ -302,7 +310,7 @@ void LatLonGrid::ComputeUnitFluxes(ParArrayHost<Real> &theta_v, ParArrayHost<Rea
         }
 
         if constexpr (parthenon::IsCoord<parthenon::UniformCylindrical>()) {
-          gflux_h(idx, nb) = ym * (SQR(xm) + SQR(ym)) * unit_psi;
+          gflux_h(idx, nb) = rz_phi_scale * ym * unit_psi;
         } else if constexpr (parthenon::IsCoord<parthenon::UniformSpherical>()) {
           const Real isz = 1.0 / std::sqrt(1.0 - SQR(zm));
           gflux_h(idx, nb) = isz * (SQR(xm) + SQR(ym)) * unit_zeta;
