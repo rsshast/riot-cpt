@@ -41,6 +41,9 @@ LatLonGrid::LatLonGrid(int ntheta, int nphi)
       cart_pos_mid("cart_pos_mid", 1, 1, 1), gflux("gflux", 1, 1) {
 
   nangles = ntheta * nphi;
+  chain_length = parthenon::IsCoord<parthenon::UniformCylindrical>()
+                     ? nphi
+                     : (parthenon::IsCoord<parthenon::UniformSpherical>() ? ntheta : 0);
 
   ParArrayHost<Real> theta_v("theta_v", ntheta);
   ParArrayHost<Real> theta_f("theta_f", ntheta + 1);

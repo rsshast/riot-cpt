@@ -158,12 +158,12 @@ namespace rad {
 VARIABLE_VECTOR(c.c.rad, intensity, false, 1); // ngroups * nangles
 VARIABLE_VECTOR(c.c.rad, aa, false, 1);        // ngroups
 VARIABLE_VECTOR(c.c.rad, ss, false, 1);        // ngroups
+VARIABLE_VECTOR(c.c.rad, source, false, 1);    // ngroups
 VARIABLE_VECTOR(c.c.rad, moments, false, 1);   // ngroups
 VARIABLE_VECTOR(c.c.rad, s1, false, 1);        // ngroups
 VARIABLE_VECTOR(c.c.rad, s2, false, 1);        // ngroups
 VARIABLE_VECTOR(c.c.rad, s3, false, 1);        // ngroups
 VARIABLE_VECTOR(c.c.rad, divfa, false, 1);     // ngroups
-VARIABLE_VECTOR(c.c.rad, tauw, false, 1);      // ngroups
 VARIABLE_SCALAR(c.c.rad, temperature, false);
 } // namespace rad
 

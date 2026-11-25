@@ -53,6 +53,8 @@ inline void RadiationPostInitialization(Mesh *pm, ParameterInput *pin,
   const int ngroups = rad_pkg->Param<int>("ngroups");
   const int nangles = rad_pkg->Param<int>("nangles");
 
+  const bool fixed_pgen_opac = rad_pkg->Param<bool>("fixed_pgen_opac");
+
   // Set opacities
   // NOTE(@pdmullen): We are not required to set opacities in the ProblemGenerator,
   // however, this makes them visible in the initial condition which is useful for viz
@@ -69,32 +71,34 @@ inline void RadiationPostInitialization(Mesh *pm, ParameterInput *pin,
   using lt = RiotUtils::LoopType<>;
   auto idx_space = lt::GetIndexSpace(IndexDomain::entire, 0, v.GetNBlocks(), md,
                                      parthenon::TopologicalElement::CC);
-  RiotLoop::outer(
-      idx_space, KOKKOS_LAMBDA(const lt::idx_range_t &idx_range, const int b) {
-        RiotLoop::inner(idx_range, [&](const int k, const int j, const int i) {
-          for (int gg = 0; gg < ngroups; ++gg) {
-            // Set opacities
-            Real &aa = v(b, ccrad::aa(gg), k, j, i) = 0.0;
-            Real &ss = v(b, ccrad::ss(gg), k, j, i) = 0.0;
-            const Real &temp = v(b, ccbulk::temperature(), k, j, i);
-            for (int m = 0; m < v.GetSize(b, ccmat::rho()); ++m) {
-              const Real &vfracm = v(b, ccmat::volume_fraction(m), k, j, i);
-              const Real rhom = v(b, ccmat::rho(m), k, j, i) / (vfracm + 1.0e-100);
-              const int &mat_id = v(b, ccmat::rho(m)).sparse_id;
-              const int &phase_id = v(b, ccmat::rho(m)).v;
-              const int opac_id = opac_from_matid(mat_id) + phase_id;
-              const Real aam = (rhom > 0)
-                                   ? opac_a(opac_id).AbsorptionCoefficient(rhom, temp, gg)
-                                   : 0.0;
-              const Real ssm = (rhom > 0)
-                                   ? opac_s(opac_id).ScatteringCoefficient(rhom, temp, gg)
-                                   : 0.0;
-              aa += vfracm * aam;
-              ss += vfracm * ssm;
+  if (!fixed_pgen_opac) {
+    RiotLoop::outer(
+        idx_space, KOKKOS_LAMBDA(const lt::idx_range_t &idx_range, const int b) {
+          RiotLoop::inner(idx_range, [&](const int k, const int j, const int i) {
+            for (int gg = 0; gg < ngroups; ++gg) {
+              // Set opacities
+              Real &aa = v(b, ccrad::aa(gg), k, j, i) = 0.0;
+              Real &ss = v(b, ccrad::ss(gg), k, j, i) = 0.0;
+              const Real &temp = v(b, ccbulk::temperature(), k, j, i);
+              for (int m = 0; m < v.GetSize(b, ccmat::rho()); ++m) {
+                const Real &vfracm = v(b, ccmat::volume_fraction(m), k, j, i);
+                const Real rhom = v(b, ccmat::rho(m), k, j, i) / (vfracm + 1.0e-100);
+                const int &mat_id = v(b, ccmat::rho(m)).sparse_id;
+                const int &phase_id = v(b, ccmat::rho(m)).v;
+                const int opac_id = opac_from_matid(mat_id) + phase_id;
+                const Real aam = (rhom > 0)
+                                     ? opac_a(opac_id).AbsorptionCoefficient(rhom, temp, gg)
+                                     : 0.0;
+                const Real ssm = (rhom > 0)
+                                     ? opac_s(opac_id).ScatteringCoefficient(rhom, temp, gg)
+                                     : 0.0;
+                aa += vfracm * aam;
+                ss += vfracm * ssm;
+              }
             }
-          }
+          });
         });
-      });
+  }
 
   // Extract initialization type
   const std::string init_type = rad_pkg->Param<std::string>("initialization_type");
@@ -125,6 +129,58 @@ inline void RadiationPostInitialization(Mesh *pm, ParameterInput *pin,
           }
         });
       });
+}
+
+// Compute the source function from the step-start intensity, opacities, and temperature.
+template <typename Temperature>
+inline TaskStatus SetSource(MeshData<Real> *md) {
+  if (md->NumBlocks() == 0) return TaskStatus::complete;
+
+  auto pm = md->GetParentPointer();
+  const auto rad_pkg = GetRadPackage(pm->packages);
+  const bool coupling = rad_pkg->Param<bool>("coupling");
+
+  // Resolved packages and indexing
+  auto &resolved_pkgs = pm->resolved_packages;
+  const int ngroups = rad_pkg->Param<int>("ngroups");
+  const int nangles = rad_pkg->Param<int>("nangles");
+  const auto unit_utils = rad_pkg->Param<UnitUtils>("unit_utils");
+  const auto fbnd = *(rad_pkg->MutableParam<ParArray1D<Real>>("fbnd_d"));
+  const auto agrid = GetAngularGridArrays(rad_pkg);
+  const auto &wght = agrid.weights;
+
+  // Packing
+  namespace ccrad = cell_variables::cell_averaged::rad;
+  static auto desc =
+      parthenon::MakePackDescriptor<Temperature, ccrad::aa, ccrad::ss,
+                                    ccrad::intensity, ccrad::source>(resolved_pkgs.get());
+  auto pack = desc.GetPack(md);
+
+  auto idx_space =
+      RiotFlatLoop::GetIndexSpace(IndexDomain::interior, pack.GetNBlocks(), md);
+  RiotFlatLoop::four_d(
+      "SetSource", idx_space,
+      KOKKOS_LAMBDA(const int &b, const int &k, const int &j, const int &i) {
+        const Real temp = coupling ? pack(b, Temperature(), k, j, i) : 0.0;
+        for (int gg = 0; gg < ngroups; ++gg) {
+          Real &source = pack(b, ccrad::source(gg), k, j, i);
+          if (!coupling) {
+            source = 0.0;
+            continue;
+          }
+          const Real ee = Emissivity(gg, temp, fbnd, ngroups, unit_utils);
+          Real jj = 0.0;
+          for (int aa = 0; aa < nangles; ++aa) {
+            jj += wght(aa) * pack(b, ccrad::intensity(GAI(nangles, gg, aa)), k, j, i);
+          }
+          const Real &siga = pack(b, ccrad::aa(gg), k, j, i);
+          const Real &sigs = pack(b, ccrad::ss(gg), k, j, i);
+          const Real sigt = siga + sigs;
+          source = (sigt > 0.0) ? (sigs * jj + siga * ee) / sigt : 0.0;
+        }
+      });
+
+  return TaskStatus::complete;
 }
 
 // Individual shared init options.

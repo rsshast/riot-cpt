@@ -14,6 +14,7 @@
 // This file was made in part with generative AI.
 
 // C++ headers
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -52,6 +53,20 @@ namespace Jacobi {
 const std::string pkg_name = "jacobi";
 const std::string input_block =
     std::string(RadiationShared::radiation_block) + "/" + pkg_name;
+
+// Convergence test furthest from its target in the latest iteration (group -1 for the
+// global test): its residual and threshold, and its estimated error, target and the
+// contraction rate behind the estimate
+struct ConvergenceStatus {
+  Real residual = std::numeric_limits<Real>::infinity();
+  Real threshold = 0.0;
+  Real error = std::numeric_limits<Real>::infinity();
+  Real target = 0.0;
+  Real rate = std::numeric_limits<Real>::infinity();
+  bool estimated = false;
+  int group = -1;
+};
+
 //----------------------------------------------------------------------------------------
 //! \fn  void Jacobi::Initialize
 //! \brief Initializes the Jacobi package
@@ -84,9 +99,61 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin,
   params.Add("niter_limit",
              pin->GetOrAddInteger(input_block, "niter_limit", 1000,
                                   "Maximum #iter permitted for Jacobi integration"));
-  params.Add("err_thr",
-             pin->GetOrAddReal(input_block, "err_thr", 1.0e-8,
-                               "Residual error threshold for Jacobi integration"));
+
+  // Retired convergence parameters
+  PARTHENON_REQUIRE(!pin->DoesParameterExist(input_block, "per_group_residual"),
+                    input_block +
+                        "/per_group_residual has been removed; set err_thr_group to "
+                        "enable the per-group tests.");
+
+  // Convergence thresholds: the relative residual of the global test (and, if
+  // err_thr_group is set, of every group) must fall below err_thr_global (err_thr_group),
+  // and if err_step_global (err_step_group) is positive, its estimated error must also
+  // fall below that fraction of its change over the time step
+  // Accept the fork's legacy key as a default for existing input decks.
+  const Real legacy_err_thr = pin->DoesParameterExist(input_block, "err_thr")
+                                  ? pin->GetReal(input_block, "err_thr")
+                                  : 1.0e-8;
+  const Real err_thr_global = pin->GetOrAddReal(
+      input_block, "err_thr_global", legacy_err_thr,
+      "Convergence threshold of the Jacobi solve: the relative residual must fall below "
+      "it and, if err_step_global > 0, it floors the target of the estimated error.");
+  params.Add("err_thr_global", err_thr_global);
+  const Real err_thr_group = pin->GetOrAddReal(
+      input_block, "err_thr_group", std::numeric_limits<Real>::max(),
+      "Per-group counterpart of err_thr_global, requiring every group's own relative "
+      "residual to fall below it (so a low-energy but important group is not masked by "
+      "the global test). Off by default.");
+  params.Add("err_thr_group", err_thr_group);
+  params.Add("err_step_global",
+             pin->GetOrAddReal(
+                 input_block, "err_step_global", 0.5,
+                 "If positive, additionally require the estimated remaining error, "
+                 "rho/(1-rho)*residual with rho the contraction rate of the residuals, "
+                 "to be below this fraction of the change in intensity over the time "
+                 "step, or below err_thr_global."));
+  const Real err_step_group = pin->GetOrAddReal(
+      input_block, "err_step_group", 0.0,
+      "Per-group counterpart of err_step_global, from every group's own contraction "
+      "rate and step change, floored at err_thr_group (which must be set). Off by "
+      "default.");
+  PARTHENON_REQUIRE(err_step_group == 0.0 ||
+                        err_thr_group < std::numeric_limits<Real>::max(),
+                    "radiation_transport/jacobi/err_step_group requires err_thr_group!");
+  params.Add("err_step_group", err_step_group);
+  params.Add("per_group_residual_floor",
+             pin->GetOrAddReal(input_block, "per_group_residual_floor", 1.0e-3,
+                               "Floor a group's residual denominator at this fraction of "
+                               "the total (all-group) denominator so a ~negligible group "
+                               "cannot hold the solve hostage."));
+
+  // Minimum-iterations
+  params.Add("niter_min",
+             pin->GetOrAddInteger(
+                 input_block, "niter_min", 0,
+                 "Minimum #iter the Jacobi solver must take before it is permitted to "
+                 "exit on convergence. Not needed if err_step_global > 0, as the "
+                 "contraction rate behind the error estimate sets its own minimum."));
   const int nreduce_limit = pin->GetOrAddInteger(
       input_block, "nreduce_limit", 0,
       "Maximum number of timestep reductions permitted when the implicit Jacobi solve "
@@ -96,12 +163,24 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin,
   const int reduce_factor = pin->GetOrAddInteger(
       input_block, "reduce_factor", 2,
       "Integer factor by which the subcycle timestep is divided each time the implicit "
-      "Jacobi solve diverges (e.g. 2 halves dt). Setting to -1 disables the stall "
-      "detector entirely in which only a NaN/Inf residual can fail a solve)");
+      "Jacobi solve diverges (e.g. 2 halves dt).");
   const int ndiverge_limit = pin->GetOrAddInteger(
       input_block, "ndiverge_limit", -1,
       "Number of consecutive Jacobi iterations without improvement on the best residual "
-      "seen so far that constitutes divergence and triggers a dt reduction/subcycle.");
+      "seen so far that constitutes divergence and triggers a dt reduction/subcycle.  "
+      "If the residuals already meet their thresholds, the stalled solve is instead "
+      "accepted as converged.  Setting to -1 disables this detector.");
+  const Real diverge_rise_frac = pin->GetOrAddReal(
+      input_block, "diverge_rise_frac", -1.0,
+      "Fractional rise of the residual above the best residual seen so far that "
+      "constitutes divergence and triggers a dt reduction/subcycle (e.g. 0.1 flags a "
+      "residual 10% above its best).  Setting to -1 disables this detector.");
+  const int nrelax_steps = pin->GetOrAddInteger(
+      input_block, "nrelax_steps", 0,
+      "If > 0, a step starts with the subcycle count the previous step finished with, "
+      "and that count is divided by reduce_factor after nrelax_steps consecutive steps "
+      "without divergence (the carried count is capped at "
+      "reduce_factor^nreduce_limit).  Setting to 0 starts every step at the full dt.");
   PARTHENON_REQUIRE(nreduce_limit >= 0,
                     "radiation_transport/jacobi/nreduce_limit must be >= 0!");
   PARTHENON_REQUIRE(reduce_factor > 1,
@@ -109,9 +188,16 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin,
   PARTHENON_REQUIRE(
       ndiverge_limit == -1 || ndiverge_limit > 0,
       "radiation_transport/jacobi/ndiverge_limit must be > 0, or -1 to disable");
+  PARTHENON_REQUIRE(
+      diverge_rise_frac == -1.0 || diverge_rise_frac > 0.0,
+      "radiation_transport/jacobi/diverge_rise_frac must be > 0, or -1 to disable");
+  PARTHENON_REQUIRE(nrelax_steps >= 0,
+                    "radiation_transport/jacobi/nrelax_steps must be >= 0!");
   params.Add("nreduce_limit", nreduce_limit);
   params.Add("reduce_factor", reduce_factor);
   params.Add("ndiverge_limit", ndiverge_limit);
+  params.Add("diverge_rise_frac", diverge_rise_frac);
+  params.Add("nrelax_steps", nrelax_steps);
 
   // Timestep controllers
   params.Add("dt_ratio_hyperbolic",
@@ -138,19 +224,28 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin,
                  "package.  0: Report no diagnostics, 1: Only report at final Jacobi "
                  "iteration, 2: Report every Jacobi iteration, 3: Report every Jacobi "
                  "iteration and temperature root find failures"));
+
+  // Reducer for residual
+  parthenon::AllReduce<HostArray1D<Real>> residual_reducer;
+  const int nres = 3 * (ngroups + 1);
+  residual_reducer.val = HostArray1D<Real>("Jacobi_pkg Residual Reducer", nres);
+  for (int i = 0; i < residual_reducer.val.size(); ++i)
+    residual_reducer.val(i) = 0.0;
+  params.Add("jresidual_reducer", residual_reducer, true);
+
+  // Solver mutable params
   params.Add("current_residual", std::numeric_limits<Real>::max(), true);
   params.Add("current_iter", std::numeric_limits<int>::max(), true);
   params.Add("solve_diverged", false, true);
   params.Add("best_residual", std::numeric_limits<Real>::max(), true);
+  params.Add("residual_history", std::vector<Real>(2 * (ngroups + 1), 0.0), true);
+  params.Add("convergence_status", ConvergenceStatus(), true);
+  params.Add("residual_met", false, true);
+  params.Add("residual_floor", false, true);
   params.Add("nstall", 0, true);
+  params.Add("ndiv_start", 1, Params::Mutability::Restart);
+  params.Add("nclean", 0, Params::Mutability::Restart);
   params.Add("time", 0.0, Params::Mutability::Restart);
-
-  // Reducer for residual
-  parthenon::AllReduce<HostArray1D<Real>> residual_reducer;
-  residual_reducer.val = HostArray1D<Real>("Jacobi_pkg Residual Reducer", 2);
-  for (int i = 0; i < residual_reducer.val.size(); ++i)
-    residual_reducer.val(i) = 0.0;
-  params.Add("jresidual_reducer", residual_reducer, true);
 
   // Radiation specific intensity I
   std::string control_field = ccrad::intensity::name();
@@ -161,6 +256,16 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin,
                          std::vector<int>({ngroups * nangles}));
   mi.RegisterRefinementOps<ProlongateSharedLinear, RestrictAverage>();
   jacobi_pkg->AddField<ccrad::intensity>(mi);
+
+  // Source function
+  // S = (sigma_a B + sigma_s J) / sigma_t of the face flux (see FaceWeights), iterated
+  // (and communicated) with the intensity
+  Metadata ms = Metadata({Metadata::Cell, Metadata::Independent, Metadata::FillGhost,
+                          Metadata::CommunicateOne, Metadata::Intensive, MetadataJacobi,
+                          MetadataOperatorSplit},
+                         std::vector<int>({ngroups}));
+  ms.RegisterRefinementOps<ProlongatePiecewiseConstant, RestrictAverage>();
+  jacobi_pkg->AddField<ccrad::source>(ms);
 
   // Opacity fields
   Metadata mo = Metadata({Metadata::Cell, Metadata::Derived, Metadata::OneCopy,
@@ -178,7 +283,6 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin,
   jacobi_pkg->AddField<ccrad::s1>(m);
   jacobi_pkg->AddField<ccrad::s2>(m);
   jacobi_pkg->AddField<ccrad::s3>(m);
-  jacobi_pkg->AddField<ccrad::tauw>(m);
 
   // Advanced temperature field
   m = Metadata({Metadata::Cell, Metadata::Derived, Metadata::OneCopy, MetadataJacobi,
@@ -383,25 +487,25 @@ TaskCollection JacobiTasks(Mesh *pm, parthenon::SimTime &tm, const Real dt) {
   // Assemble MeshData subsets once; they are reused across any subcycles this step
   namespace mdname = container_names;
   namespace ccrad = cell_variables::cell_averaged::rad;
-  std::vector<std::string> intensity_names = pm->GetVariableNames(
-      std::vector<std::string>{ccrad::intensity::name()}, std::vector<int>{});
-  std::vector<std::string> opac_names = pm->GetVariableNames(
-      std::vector<std::string>{ccrad::aa::name(), ccrad::ss::name()}, std::vector<int>{});
+  std::vector<std::string> iterated = {ccrad::intensity::name(), ccrad::source::name()};
+  std::vector<std::string> intensity_names =
+      pm->GetVariableNames(iterated, std::vector<int>{});
   auto &base = pm->mesh_data.Get();
   pm->mesh_data.Add(mdname::riter, base, intensity_names);
   pm->mesh_data.Add(mdname::rout, base, intensity_names);
   pm->mesh_data.AddShallow(mdname::rbase, base, jacobi_names);
   pm->mesh_data.AddShallow(mdname::ubase, base, unsplit_names);
-  pm->mesh_data.AddShallow(mdname::ropac, base, opac_names);
 
   // Subcycle controls
   const int nreduce_limit = jacobi_pkg->Param<int>("nreduce_limit");
   const int reduce_factor = jacobi_pkg->Param<int>("reduce_factor");
+  const int nrelax_steps = jacobi_pkg->Param<int>("nrelax_steps");
   const int verbose = jacobi_pkg->Param<int>("verbose");
 
   // Adaptive subcycle loop
-  int ndiv = 1;
-  int nremaining = 1;
+  const int ndiv_start = (nrelax_steps > 0) ? jacobi_pkg->Param<int>("ndiv_start") : 1;
+  int ndiv = ndiv_start;
+  int nremaining = ndiv_start;
   int nreduce = 0;
   int nsub = 0;
   while (nremaining > 0) {
@@ -409,7 +513,7 @@ TaskCollection JacobiTasks(Mesh *pm, parthenon::SimTime &tm, const Real dt) {
     const Real t_local = dt * (ndiv - nremaining) / ndiv;
 
     // Report subcycle progress
-    if (nreduce > 0 && Globals::my_rank == 0 && verbose >= 1) {
+    if (ndiv > 1 && Globals::my_rank == 0 && verbose >= 1) {
       printf(
           "(Jacobi) Subcycle attempt %d | dt_sub: %24.16e | committed: %6.2f%% of dt\n",
           nsub + 1, dt_this, 100.0 * t_local / dt);
@@ -436,13 +540,14 @@ TaskCollection JacobiTasks(Mesh *pm, parthenon::SimTime &tm, const Real dt) {
     } else {
       // Solve diverged: back out and retry the remaining span with a reduced timestep
       ++nreduce;
-      PARTHENON_REQUIRE(
-          nreduce <= nreduce_limit,
-          "Implicit Jacobi radiation solve diverged after " +
-              std::to_string(nreduce_limit) + " timestep reduction(s).  Residual: " +
-              std::to_string(jacobi_pkg->Param<Real>("current_residual")) +
-              ", dt_sub: " + std::to_string(dt_this) +
-              ".  Raise nreduce_limit, loosen ndiverge_limit, or check the setup.");
+      PARTHENON_REQUIRE(nreduce <= nreduce_limit,
+                        "Implicit Jacobi radiation solve diverged after " +
+                            std::to_string(nreduce_limit) +
+                            " timestep reduction(s).  Residual: " +
+                            std::to_string(jacobi_pkg->Param<Real>("current_residual")) +
+                            ", dt_sub: " + std::to_string(dt_this) +
+                            ".  Raise nreduce_limit, loosen "
+                            "ndiverge_limit/diverge_rise_frac, or check the setup.");
       ndiv *= reduce_factor;
       nremaining *= reduce_factor;
       if (Globals::my_rank == 0 && verbose >= 1)
@@ -452,9 +557,24 @@ TaskCollection JacobiTasks(Mesh *pm, parthenon::SimTime &tm, const Real dt) {
     }
   }
 
-  if (nreduce > 0 && Globals::my_rank == 0 && verbose >= 1) {
+  if (ndiv > 1 && Globals::my_rank == 0 && verbose >= 1) {
     printf("(Jacobi) Completed operator-split step in %d subcycles (%d reduction(s))\n",
            nsub, nreduce);
+  }
+
+  // Carry the subcycle count into the next step, relaxing it after a clean streak
+  if (nrelax_steps > 0) {
+    int ndiv_next = 1;
+    for (int r = 0; r < nreduce_limit && ndiv_next < ndiv; ++r)
+      ndiv_next *= reduce_factor;
+    ndiv_next = std::min(ndiv_next, ndiv);
+    int nclean = (nreduce > 0) ? 0 : jacobi_pkg->Param<int>("nclean") + 1;
+    if (ndiv_next > 1 && nclean >= nrelax_steps) {
+      ndiv_next /= reduce_factor;
+      nclean = 0;
+    }
+    jacobi_pkg->UpdateParam("ndiv_start", std::max(ndiv_next, 1));
+    jacobi_pkg->UpdateParam("nclean", nclean);
   }
 
   return TaskCollection();
@@ -466,6 +586,7 @@ TaskCollection JacobiTasks(Mesh *pm, parthenon::SimTime &tm, const Real dt) {
 TaskCollection JacobiSolve(Mesh *pmesh, const Real time, const Real dt) {
   using namespace ::parthenon::Update;
   namespace mdname = container_names;
+  namespace ccrad = cell_variables::cell_averaged::rad;
   TaskCollection tc;
   TaskID none(0);
   const auto any = parthenon::BoundaryType::any;
@@ -484,34 +605,35 @@ TaskCollection JacobiSolve(Mesh *pmesh, const Real time, const Real dt) {
     auto &riter = pmesh->mesh_data.GetOrAdd(mdname::riter, i);
     auto &rout = pmesh->mesh_data.GetOrAdd(mdname::rout, i);
     auto &ubase = pmesh->mesh_data.GetOrAdd(mdname::ubase, i);
-    auto &ropac = pmesh->mesh_data.GetOrAdd(mdname::ropac, i);
     auto &tl = tr[i];
 
     // Start receives on MeshData registers
-    auto srec = tl.AddTask(none, parthenon::StartReceiveBoundBufs<any>, ropac);
+    auto srec = tl.AddTask(none, parthenon::StartReceiveBoundBufs<any>, rbase);
     srec = tl.AddTask(srec, parthenon::StartReceiveBoundBufs<any>, rout);
 
     // Set opacities
     auto set_opac = tl.AddTask(none, SetOpacities, rbase.get(), ubase.get());
-    auto opac_bc =
-        parthenon::AddBoundaryExchangeTasks(set_opac, tl, ropac, pmesh->multilevel);
+
+    auto set_src =
+        tl.AddTask(set_opac, RadiationInit::SetSource<ccrad::temperature>, rbase.get());
+
+    // Reset iterator
+    auto reset_iter =
+        tl.AddTask(TaskQualifier::once_per_region | TaskQualifier::local_sync, set_src,
+                   ResetIterator, rbase.get(), time, dt);
+
+    // Fill ghosts with boundary conditions at the advanced time
+    auto base_bc =
+        parthenon::AddBoundaryExchangeTasks(reset_iter, tl, rbase, pmesh->multilevel);
 
     // Initialize solution in riter
     auto init_iter = tl.AddTask(
-        none, sparse_update::DeepCopyData<parthenon::MetadataFlag, MeshData<Real>>,
+        TaskQualifier::local_sync, base_bc,
+        sparse_update::DeepCopyData<parthenon::MetadataFlag, MeshData<Real>>,
         std::vector<MetadataFlag>({Metadata::Independent}), riter.get(), rbase.get());
 
-    // Reset iterator
-    auto reset_iter = tl.AddTask(TaskQualifier::once_per_region, none, ResetIterator,
-                                 rbase.get(), time, dt);
-
-    // Prepare for Jacobi by setting tau weights
-    auto prep_jacobi =
-        tl.AddTask(TaskQualifier::local_sync, opac_bc | init_iter | reset_iter,
-                   PrepareForIterations, rbase.get());
-
     // Execute Jacobi iterations
-    auto [solver, solver_id] = tl.AddSublist(prep_jacobi, {1, max_iters});
+    auto [solver, solver_id] = tl.AddSublist(init_iter, {1, max_iters});
     CreateJacobiTaskList(none, i, pmesh, solver, solver_id, presidual, rbase, riter, rout,
                          ubase, dt);
   }
@@ -609,7 +731,7 @@ TaskID CreateJacobiTaskList(const TaskID &begin, const int i, Mesh *pmesh,
   auto rsrc = solver.AddTask(update, ApplyRHS, rbase.get(), rout.get(), ubase.get(), dt);
   auto bc = parthenon::AddBoundaryExchangeTasks(rsrc, solver, rout, pmesh->multilevel);
   auto check = solver.AddTask(TaskQualifier::local_sync, bc, CheckConvergence,
-                              &(presidual->val), riter.get(), rout.get());
+                              &(presidual->val), rbase.get(), riter.get(), rout.get());
   auto start_reduce_residual =
       solver.AddTask(TaskQualifier::once_per_region, check,
                      &AllReduce<HostArray1D<Real>>::StartReduce, presidual, MPI_SUM);
@@ -627,8 +749,8 @@ TaskID CreateJacobiTaskList(const TaskID &begin, const int i, Mesh *pmesh,
 //----------------------------------------------------------------------------------------
 //! \fn  TaskStatus CheckConvergence
 //! \brief Check for convergence in iterative solution
-TaskStatus CheckConvergence(HostArray1D<Real> *presidual, MeshData<Real> *riter,
-                            MeshData<Real> *rout) {
+TaskStatus CheckConvergence(HostArray1D<Real> *presidual, MeshData<Real> *rbase,
+                            MeshData<Real> *riter, MeshData<Real> *rout) {
   if (rout->NumBlocks() == 0) return TaskStatus::complete;
 
   auto pm = rout->GetParentPointer();
@@ -641,28 +763,56 @@ TaskStatus CheckConvergence(HostArray1D<Real> *presidual, MeshData<Real> *riter,
   namespace ccrad = cell_variables::cell_averaged::rad;
   static auto desc_i = MakePackDescriptor<ccrad::intensity>(resolved_pkgs.get());
   static auto desc_o = MakePackDescriptor<ccrad::intensity>(resolved_pkgs.get());
+  static auto desc_b = MakePackDescriptor<ccrad::intensity>(resolved_pkgs.get());
   auto vi = desc_i.GetPack(riter);
   auto vo = desc_o.GetPack(rout);
+  auto vb = desc_b.GetPack(rbase);
 
   // Residual reductions
+  // NOTE(@pdmullen): When moving to the (optional) per group residual model, we must
+  // track each individual group's ||\Delta I_g|| and ||I_g||.  We below opt for a for
+  // loop that launches ngroup reductions (beware kernel launch latency).  Alternative
+  // strategies might invoke:
+  //
+  //   - Hierarchical reductions (outer: blocks * ngroups)... enough threadblocks?
+  //   - Single kernel with atomics?
+  //   - Single reduction to a compile-time-sized ~3*MAX_GROUPS array.  Register pressure?
   using rt =
-      RiotFlatReduce::ReductionType<RiotUtils::GlobalSum<Real, Kokkos::HostSpace, 2>>;
-  auto idx_space =
-      rt::GetIndexSpace(IndexDomain::interior, vo.GetNBlocks(), ngroups * nangles, rout);
-  const auto res = rt::five_d(
-      "JacobiResidual", idx_space,
-      KOKKOS_LAMBDA(const int b, const int n, const int k, const int j, const int i,
-                    RiotUtils::array_type<Real, 2> &rsum) {
-        rsum.my_array[0] += std::abs(vi(b, n, k, j, i) - vo(b, n, k, j, i));
-        rsum.my_array[1] += vo(b, n, k, j, i);
-      });
-  Kokkos::fence();
-
+      RiotFlatReduce::ReductionType<RiotUtils::GlobalSum<Real, Kokkos::HostSpace, 3>>;
   auto &residual = *presidual;
-  residual(0) += res.my_array[0];
-  residual(1) += res.my_array[1];
+  for (int gg = 0; gg < ngroups; ++gg) {
+    auto gspace =
+        rt::GetIndexSpace(IndexDomain::interior, vo.GetNBlocks(), nangles, rout);
+    const auto gres = rt::five_d(
+        "JacobiResidualGroup", gspace,
+        KOKKOS_LAMBDA(const int b, const int aa, const int k, const int j, const int i,
+                      RiotUtils::array_type<Real, 3> &rsum) {
+          const int n = GAI(nangles, gg, aa);
+          rsum.my_array[0] += std::abs(vi(b, n, k, j, i) - vo(b, n, k, j, i));
+          rsum.my_array[1] += vo(b, n, k, j, i);
+          rsum.my_array[2] += std::abs(vb(b, n, k, j, i) - vo(b, n, k, j, i));
+        });
+    Kokkos::fence();
+    for (int r = 0; r < 3; ++r) {
+      residual(r) += gres.my_array[r];
+      residual(3 * (gg + 1) + r) += gres.my_array[r];
+    }
+  }
 
   return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn  Real ContractionRate
+//! \brief Contraction rate of the residuals at iteration m, from the residual and the
+//! two before it (most recent first). While the rate is still rising, its rise is
+//! extrapolated over the 1 / (1 - rate) iterations the error estimate spans. Infinite
+//! until it is measurable.
+static Real ContractionRate(const int m, const Real residual, const Real *history) {
+  if (m < 3) return std::numeric_limits<Real>::infinity();
+  const Real rho = residual / std::max(history[0], 1.0e-100);
+  const Real rho_prev = history[0] / std::max(history[1], 1.0e-100);
+  return (rho < 1.0) ? rho + std::max(rho - rho_prev, 0.0) / (1.0 - rho) : rho;
 }
 
 //----------------------------------------------------------------------------------------
@@ -676,24 +826,92 @@ TaskStatus IncrementCounterAndSetResidual(HostArray1D<Real> *presidual, Mesh *pm
 
   // update current residual
   auto &v = *presidual;
-  const Real current_residual = v(0) / (std::max(v(1), 1.0e-100) + (v(1) <= 1.0e-100));
+  const Real denom = std::max(v(1), 1.0e-100) + (v(1) <= 1.0e-100);
+  const Real current_residual = v(0) / denom;
   jacobi_pkg->UpdateParam("current_residual", current_residual);
 
-  // Divergence detection
+  // Convergence tests: the residual against the threshold and, if the step fraction is
+  // positive, the estimated remaining error against that fraction of the step change,
+  // floored at the threshold. A residual at or below the machine epsilon is the fixed
+  // point to working precision, where the contraction rate only measures round-off (and
+  // may read >= 1 indefinitely), so its error is the residual itself. Slot 0 holds the
+  // residual history of the global test, slot g + 1 that of group g.
+  auto &history = *jacobi_pkg->MutableParam<std::vector<Real>>("residual_history");
+  bool threshold_met = true;
+  bool residual_met = true;
+  ConvergenceStatus status;
+  Real worst = -std::numeric_limits<Real>::infinity();
+  auto test = [&](const int slot, const Real residual, const Real step,
+                  const Real threshold, const Real step_fraction) {
+    Real *h = &history[2 * slot];
+    const Real rate = ContractionRate(iter_counter, residual, h);
+    h[1] = h[0];
+    h[0] = residual;
+    const bool estimated = (step_fraction > 0.0);
+    const Real error = (residual <= std::numeric_limits<Real>::epsilon()) ? residual
+                       : (rate < 1.0) ? rate / (1.0 - rate) * residual
+                                      : std::numeric_limits<Real>::infinity();
+    const Real target = std::max(step_fraction * step, threshold);
+    threshold_met = threshold_met && (residual <= threshold);
+    residual_met =
+        residual_met && (residual <= threshold) && (!estimated || error <= target);
+    const Real tiny = std::numeric_limits<Real>::min();
+    Real ratio = residual / std::max(threshold, tiny);
+    if (estimated && !(error / std::max(target, tiny) <= ratio)) {
+      ratio = error / std::max(target, tiny);
+    }
+    if (!(ratio <= worst)) {
+      worst = ratio;
+      status = {residual, threshold, error, target, rate, estimated, slot - 1};
+    }
+  };
+  test(0, current_residual, v(2) / denom, jacobi_pkg->Param<Real>("err_thr_global"),
+       jacobi_pkg->Param<Real>("err_step_global"));
+
+  // Optional per-group tests
+  const int ngroups = jacobi_pkg->Param<int>("ngroups");
+  const Real err_thr_group = jacobi_pkg->Param<Real>("err_thr_group");
+  if (err_thr_group < std::numeric_limits<Real>::max()) {
+    const Real err_step_group = jacobi_pkg->Param<Real>("err_step_group");
+    const Real floor_frac = jacobi_pkg->Param<Real>("per_group_residual_floor");
+    const Real denom_floor = floor_frac * std::max(v(1), 1.0e-100);
+    for (int gg = 0; gg < ngroups; ++gg) {
+      const Real denom_g = std::max(v(3 * (gg + 1) + 1), std::max(denom_floor, 1.0e-100));
+      const Real scale_g = 1.0 / (denom_g + (denom_g <= 1.0e-100));
+      test(gg + 1, v(3 * (gg + 1)) * scale_g, v(3 * (gg + 1) + 2) * scale_g,
+           err_thr_group, err_step_group);
+    }
+  }
+  jacobi_pkg->UpdateParam("convergence_status", status);
+
+  // Divergence detection. Both detectors flag divergence only while a residual is above
+  // its threshold. A solve whose residuals meet their thresholds but which stalls before
+  // its error estimates are met has reached the floor Jacobi can resolve, and is
+  // accepted.
   const Real best_residual = jacobi_pkg->Param<Real>("best_residual");
   const int ndiverge_limit = jacobi_pkg->Param<int>("ndiverge_limit");
+  const Real diverge_rise_frac = jacobi_pkg->Param<Real>("diverge_rise_frac");
   int nstall = jacobi_pkg->Param<int>("nstall");
   const bool improved = current_residual < best_residual;
   nstall = improved ? 0 : nstall + 1;
   const bool stalled = (ndiverge_limit >= 0) && (nstall >= ndiverge_limit);
-  const bool diverged = !std::isfinite(current_residual) || stalled;
+  const bool residual_floor = stalled && threshold_met && !residual_met;
+  if (residual_floor) residual_met = true;
+  const bool rose =
+      !threshold_met && (diverge_rise_frac > 0.0) &&
+      (current_residual - best_residual > diverge_rise_frac * best_residual);
+  const bool diverged =
+      !std::isfinite(current_residual) || (stalled && !threshold_met) || rose;
   jacobi_pkg->UpdateParam("nstall", nstall);
   if (improved) jacobi_pkg->UpdateParam("best_residual", current_residual);
   if (diverged) jacobi_pkg->UpdateParam("solve_diverged", true);
+  jacobi_pkg->UpdateParam("residual_met", residual_met);
+  jacobi_pkg->UpdateParam("residual_floor", residual_floor);
 
   // zero residuals in prep for next iteration
-  v(0) = 0.0;
-  v(1) = 0.0;
+  for (int r = 0; r < v.size(); ++r) {
+    v(r) = 0.0;
+  }
 
   return TaskStatus::complete;
 }
@@ -708,28 +926,59 @@ TaskStatus CompletionFunction(int i, HostArray1D<Real> *presidual, MeshData<Real
   auto pm = rout->GetParentPointer();
   auto jacobi_pkg = pm->packages.Get(pkg_name);
   const int iter_counter = jacobi_pkg->Param<int>("current_iter");
-  const Real residual = jacobi_pkg->Param<Real>("current_residual");
-  const Real err_thr = jacobi_pkg->Param<Real>("err_thr");
   const int niter_limit = jacobi_pkg->Param<int>("niter_limit");
+  const int niter_min = jacobi_pkg->Param<int>("niter_min");
   const int verbose = jacobi_pkg->Param<int>("verbose");
+  const bool report = (i == 0 && Globals::my_rank == 0);
+  const int niter_done = iter_counter - 1;
+
+  // Report the test furthest from convergence: its residual against its threshold and,
+  // if any step fraction is positive, its estimated error against its target (if
+  // tested) and the contraction rate behind the estimate, and its group unless it is the
+  // global test
+  const auto &status = jacobi_pkg->Param<ConvergenceStatus>("convergence_status");
+  const bool step_rule = (jacobi_pkg->Param<Real>("err_step_global") > 0.0) ||
+                         (jacobi_pkg->Param<Real>("err_step_group") > 0.0);
+  auto print = [&](const char *outcome, const bool note_niter_min) {
+    char residual[16] = "--", error[16] = "--", target[16] = "--", rate[16] = "--",
+         line[160];
+    if (std::isfinite(status.residual))
+      snprintf(residual, sizeof(residual), "%.3e", status.residual);
+    if (status.estimated && std::isfinite(status.error))
+      snprintf(error, sizeof(error), "%.3e", status.error);
+    if (status.estimated) snprintf(target, sizeof(target), "%.3e", status.target);
+    if (std::isfinite(status.rate)) snprintf(rate, sizeof(rate), "%.3f", status.rate);
+    int len = snprintf(line, sizeof(line), "(Jacobi) iter: %4d | res %9s / thr %9.3e",
+                       niter_done, residual, status.threshold);
+    if (step_rule) {
+      len += snprintf(line + len, sizeof(line) - len, " | est %9s / tgt %9s | rate %5s",
+                      error, target, rate);
+    }
+    if (status.group >= 0)
+      len += snprintf(line + len, sizeof(line) - len, " | group %3d", status.group);
+    if (note_niter_min)
+      len += snprintf(line + len, sizeof(line) - len, " | niter_min %d", niter_min);
+    printf("%s\n", line);
+    if (outcome[0] != '\0') printf("(Jacobi) %s\n", outcome);
+  };
 
   // Iterate or finalize
+  const bool residual_met = jacobi_pkg->Param<bool>("residual_met");
   if (jacobi_pkg->Param<bool>("solve_diverged")) {
-    // Divergence detected: stop iterating, back out, retry at smaller dt
-    if (i == 0 && Globals::my_rank == 0 && verbose >= 1)
-      printf("(Jacobi) Diverged! iter: %d err: %24.16e\n", iter_counter - 1, residual);
+    if (report && verbose >= 1) print("Diverged!", false);
     return TaskStatus::complete;
-  } else if (residual <= err_thr) {
-    if (i == 0 && Globals::my_rank == 0 && verbose >= 1)
-      printf("(Jacobi) Converged! iter: %d err: %24.16e\n", iter_counter - 1, residual);
+  } else if (residual_met && niter_done >= niter_min) {
+    if (report && verbose >= 1) {
+      print(jacobi_pkg->Param<bool>("residual_floor") ? "Converged (at residual floor)!"
+                                                      : "Converged!",
+            false);
+    }
     return TaskStatus::complete;
-  } else if (iter_counter - 1 >= niter_limit) {
-    if (i == 0 && Globals::my_rank == 0 && verbose >= 1)
-      printf("(Jacobi) Reached niter_limit: %d err: %24.16e\n", niter_limit, residual);
+  } else if (niter_done >= niter_limit) {
+    if (report && verbose >= 1) print("Hit limit!", false);
     return TaskStatus::complete;
   } else {
-    if (i == 0 && Globals::my_rank == 0 && verbose == 2)
-      printf("(Jacobi) iter: %d err: %24.16e\n", iter_counter - 1, residual);
+    if (report && verbose >= 2) print("", residual_met);
     auto copy_data = sparse_update::DeepCopyData<parthenon::MetadataFlag, MeshData<Real>>(
         std::vector<MetadataFlag>({Metadata::Independent}), riter, rout);
     return TaskStatus::iterate;
@@ -822,64 +1071,9 @@ TaskStatus ResetIterator(MeshData<Real> *rbase, const Real time, const Real dt) 
 
   // Reset iterator and set time in preparation for iterations
   jacobi_pkg->UpdateParam("current_iter", 1);
+  auto &history = *jacobi_pkg->MutableParam<std::vector<Real>>("residual_history");
+  std::fill(history.begin(), history.end(), 0.0);
   jacobi_pkg->UpdateParam("time", time + dt);
-
-  return TaskStatus::complete;
-}
-
-//----------------------------------------------------------------------------------------
-//! \fn  void Jacobi::PrepareForIterations
-//! \brief Reset iterators and set matrix coefficients
-TaskStatus PrepareForIterations(MeshData<Real> *rbase) {
-  // Return if no blocks in MeshData
-  if (rbase->NumBlocks() == 0) return TaskStatus::complete;
-
-  // Extract Jacobi package
-  using parthenon::MakePackDescriptor;
-  auto pm = rbase->GetParentPointer();
-  auto jacobi_pkg = pm->packages.Get(pkg_name);
-
-  // Indexing
-  auto &resolved_pkgs = pm->resolved_packages;
-  IndexRange ib = rbase->GetBoundsI(IndexDomain::interior);
-  IndexRange jb = rbase->GetBoundsJ(IndexDomain::interior);
-  IndexRange kb = rbase->GetBoundsK(IndexDomain::interior);
-  const int ndim = pm->ndim;
-  const bool multid = ndim > 1;
-  const bool threed = ndim > 2;
-  const int ngroups = jacobi_pkg->Param<int>("ngroups");
-
-  // Additional Jacobi package params
-  const auto futils = jacobi_pkg->Param<FluxUtils>("flux_utils");
-  const Real beta = futils.beta;
-  const Real tmax = futils.taumax;
-
-  // Packing
-  namespace ccr = cell_variables::cell_averaged::rad;
-  static auto desc_g =
-      MakePackDescriptor<ccr::tauw, ccr::aa, ccr::ss>(resolved_pkgs.get());
-  auto vg = desc_g.GetPack(rbase);
-
-  // Optical-depth weights are needed one cell into the ghost layer in each active
-  // direction, so extend the interior bounds by one there.
-  auto idx_space = RiotFlatLoop::GetIndexSpace(
-      vg.GetNBlocks(), ngroups, {kb.s - threed, kb.e + threed},
-      {jb.s - multid, jb.e + multid}, {ib.s - 1, ib.e + 1});
-  RiotFlatLoop::five_d(
-      "OpticalDepthWeights", idx_space,
-      KOKKOS_LAMBDA(const int &b, const int &gg, const int &k, const int &j,
-                    const int &i) {
-        // Extract coordinates
-        auto &coords = vg.GetCoordinates(b);
-        Real dxmin = coords.CellWidth<X1DIR>(k, j, i);
-        if (multid) dxmin = std::min(dxmin, coords.CellWidth<X2DIR>(k, j, i));
-        if (threed) dxmin = std::min(dxmin, coords.CellWidth<X3DIR>(k, j, i));
-
-        // Optical depth coefficients
-        const Real tau =
-            beta * dxmin * (vg(b, ccr::aa(gg), k, j, i) + vg(b, ccr::ss(gg), k, j, i));
-        vg(b, ccr::tauw(gg), k, j, i) = TauWeight(tau, tmax);
-      });
 
   return TaskStatus::complete;
 }
@@ -895,6 +1089,8 @@ TaskStatus JacobiUpdate(MeshData<Real> *rbase, MeshData<Real> *riter,
   auto pm = rout->GetParentPointer();
   auto jacobi_pkg = pm->packages.Get(pkg_name);
   const bool split_g1 = jacobi_pkg->Param<bool>("split_g1");
+  const int nchain = jacobi_pkg->Param<int>("chain_length");
+  const bool coupling = jacobi_pkg->Param<bool>("coupling");
 
   // Resolved packages and indexing
   auto &resolved_pkgs = pm->resolved_packages;
@@ -920,12 +1116,15 @@ TaskStatus JacobiUpdate(MeshData<Real> *rbase, MeshData<Real> *riter,
   // Packing
   namespace ccr = cell_variables::cell_averaged::rad;
   using parthenon::MakePackDescriptor;
-  static auto desc_g = MakePackDescriptor<ccr::tauw>(resolved_pkgs.get());
+  static auto desc_g = MakePackDescriptor<ccr::aa, ccr::ss>(resolved_pkgs.get());
   static auto desc_i = MakePackDescriptor<ccr::intensity>(resolved_pkgs.get());
+  static auto desc_s = MakePackDescriptor<ccr::source>(resolved_pkgs.get());
   auto vg = desc_g.GetPack(rbase);
   auto vb = desc_i.GetPack(rbase);
   auto vi = desc_i.GetPack(riter);
   auto vo = desc_i.GetPack(rout);
+  auto vs = desc_s.GetPack(riter);
+  auto vs_out = desc_s.GetPack(rout);
 
   // Angular flux indexing
   const auto NDIR = AngularFluxDirs();
@@ -943,17 +1142,22 @@ TaskStatus JacobiUpdate(MeshData<Real> *rbase, MeshData<Real> *riter,
         // Indexing
         const int gg = GI(nangles, n);
         const int aa = AI(nangles, n);
+        // ApplyRHS replaces this value if the temperature solve succeeds.
+        if (aa == 0) {
+          vs_out(b, ccr::source(gg), k, j, i) = vs(b, ccr::source(gg), k, j, i);
+        }
 
         // Compute Jacobi coefficients
         // clang-format off
+        const auto tau = FaceTaus(vg, coords, ndim, coupling, gg, b, k, j, i);
         Real g1p = 1.0, g1pp = 0.0;
         std::array<Real, 6> gn = {0.0};
-        GCoef<X1DIR>(vg, coords, cp, NDIR, ivol, split_g1, gg, aa,
-                     b, k, j, i, g1p, g1pp, gn[0], gn[1]);
-        if (multid) GCoef<X2DIR>(vg, coords, cp, NDIR, ivol, split_g1, gg, aa,
-                                 b, k, j, i, g1p, g1pp, gn[2], gn[3]);
-        if (threed) GCoef<X3DIR>(vg, coords, cp, NDIR, ivol, split_g1, gg, aa,
-                                 b, k, j, i, g1p, g1pp, gn[4], gn[5]);
+        GCoef<X1DIR>(coords, cp, NDIR, ivol, split_g1,
+                     tau, aa, k, j, i, g1p, g1pp, gn[0], gn[1]);
+        if (multid) GCoef<X2DIR>(coords, cp, NDIR, ivol, split_g1,
+                                 tau, aa, k, j, i, g1p, g1pp, gn[2], gn[3]);
+        if (threed) GCoef<X3DIR>(coords, cp, NDIR, ivol, split_g1,
+                                 tau, aa, k, j, i, g1p, g1pp, gn[4], gn[5]);
         // clang-format on
 
         // Spatial flux divergence operator
@@ -964,22 +1168,38 @@ TaskStatus JacobiUpdate(MeshData<Real> *rbase, MeshData<Real> *riter,
         df += threed *
               (gn[4] * vi(b, n, k - threed, j, i) + gn[5] * vi(b, n, k + threed, j, i));
 
-        // Angular flux divergence operator
+        // Source function part of the face flux from neighbors (lagged; the cell's own
+        // source function, with coefficient gs, is implicit in ApplyRHS)
+        // clang-format off
+        Real gs = 0.0;
+        df += SourceFlux<X1DIR>(vs, coords, cp, NDIR, ivol,
+                                tau, aa, b, gg, k, j, i, gs);
+        if (multid) df += SourceFlux<X2DIR>(vs, coords, cp, NDIR, ivol,
+                                            tau, aa, b, gg, k, j, i, gs);
+        if (threed) df += SourceFlux<X3DIR>(vs, coords, cp, NDIR, ivol,
+                                            tau, aa, b, gg, k, j, i, gs);
+        // clang-format on
+
+        // Angular flux divergence operator (upwind intensity part of the angular edges;
+        // their source function part is the cell's own, implicit in ApplyRHS)
         [[maybe_unused]] auto &wght_ = wght;
         [[maybe_unused]] auto &numn_ = numn;
         [[maybe_unused]] auto &gflx_ = gflx;
         [[maybe_unused]] auto &arcw_ = arcw;
         [[maybe_unused]] auto &indn_ = indn;
+        [[maybe_unused]] auto &nchain_ = nchain;
         if constexpr (do_angular_fluxes) {
           const Real mcw_ix1 = -cdt * InverseRadiusForAngularFlux(coords, i) / wght_(aa);
+          const auto [blo, bhi] = ChainWeights(cp, NDIR, wght_, nchain_, tau, aa);
           for (int nb = 0; nb < numn_(aa); ++nb) {
-            const Real na = mcw_ix1 * gflx_(aa, nb) * arcw_(aa, nb);
+            const Real na = mcw_ix1 * gflx_(aa, nb) * arcw_(aa, nb) *
+                            AngularWeight(indn_, aa, nb, blo, bhi);
             g1p += (na > 0) * na;
             df += (na < 0) * na * vi(b, GAI(nangles, gg, indn_(aa, nb)), k, j, i);
           }
         }
 
-        vo(b, n, k, j, i) = std::max((vb(b, n, k, j, i) - df) / g1p, 0.0);
+        vo(b, n, k, j, i) = (vb(b, n, k, j, i) - df) / g1p;
       });
 
   return TaskStatus::complete;
@@ -999,6 +1219,7 @@ TaskStatus ApplyRHS(MeshData<Real> *rbase, MeshData<Real> *rout, MeshData<Real> 
   const bool coupling = jacobi_pkg->Param<bool>("coupling");
   if (!(coupling)) return TaskStatus::complete;
   const bool split_g1 = jacobi_pkg->Param<bool>("split_g1");
+  const int nchain = jacobi_pkg->Param<int>("chain_length");
 
   // troot verbosity flag
   const bool verbose = (jacobi_pkg->Param<int>("verbose") == 3);
@@ -1028,6 +1249,7 @@ TaskStatus ApplyRHS(MeshData<Real> *rbase, MeshData<Real> *rout, MeshData<Real> 
   const auto &arcw = agrid.arc_weights;
   const auto &wght = agrid.weights;
   const auto &numn = agrid.num_neighbors;
+  const auto &indn = agrid.ind_neighbors;
 
   // Hydro
   auto &hydro_pkg = pm->packages.Get("hydro");
@@ -1052,17 +1274,17 @@ TaskStatus ApplyRHS(MeshData<Real> *rbase, MeshData<Real> *rout, MeshData<Real> 
   namespace ccmat = cell_variables::cell_averaged::mat;
   namespace cm = cell_variables::material_averaged;
   namespace ccrad = cell_variables::cell_averaged::rad;
-  static auto desc_g = MakePackDescriptor<ccrad::tauw>(resolved_pkgs.get());
   static auto desc_b =
       MakePackDescriptor<ccrad::aa, ccrad::ss, ccrad::s1, ccrad::s2, ccrad::s3,
                          ccrad::temperature>(resolved_pkgs.get());
   static auto desc_u = MakePackDescriptor<ccmat::rho, cm::rho, ccbulk::temperature,
                                           ccbulk::internal_energy>(resolved_pkgs.get());
   static auto desc_o = MakePackDescriptor<ccrad::intensity>(resolved_pkgs.get());
-  auto vg = desc_g.GetPack(rbase);
+  static auto desc_s = MakePackDescriptor<ccrad::source>(resolved_pkgs.get());
   auto vb = desc_b.GetPack(rbase);
   auto vu = desc_u.GetPack(ubase);
   auto vo = desc_o.GetPack(rout);
+  auto vs = desc_s.GetPack(rout);
 
   // Angular flux indexing
   const auto NDIR = AngularFluxDirs();
@@ -1074,7 +1296,7 @@ TaskStatus ApplyRHS(MeshData<Real> *rbase, MeshData<Real> *rout, MeshData<Real> 
       "ApplyRHS", idx_space,
       KOKKOS_LAMBDA(const int &b, const int &k, const int &j, const int &i) {
         // Extract coordinates
-        auto &coords = vg.GetCoordinates(b);
+        auto &coords = vb.GetCoordinates(b);
         const Real ivol = 0.5 * cdt / coords.CellVolume(k, j, i);
         Real mcw = 0.0;
         if constexpr (do_angular_fluxes) {
@@ -1097,12 +1319,17 @@ TaskStatus ApplyRHS(MeshData<Real> *rbase, MeshData<Real> *rout, MeshData<Real> 
           Real &aa1 = vb(b, ccrad::s1(gg), k, j, i) = 0.0;
           Real &aa2 = vb(b, ccrad::s2(gg), k, j, i) = 0.0;
           Real &aa3 = vb(b, ccrad::s3(gg), k, j, i) = 0.0;
+          // ...where the face fluxes carry the cell's own source function gs S, so that
+          //      (g1 + cdt sigma_t) I = g1 I* + (cdt sigma_t - gs) S
+          // ...with cdt sigma_t S = cdt sigma_a B + cdt sigma_s J...
+          const auto tau = FaceTaus(vb, coords, ndim, coupling, gg, b, k, j, i);
           for (int aa = 0; aa < nangles; ++aa) {
-            const Real g1 = G1Coef(vg, coords, cp, NDIR, ndim, wght, gflx, arcw, numn,
-                                   ivol, mcw, split_g1, gg, aa, b, k, j, i);
+            Real gs = 0.0;
+            const Real g1 = G1Coef(coords, cp, NDIR, ndim, wght, gflx, arcw, numn, indn,
+                                   ivol, mcw, split_g1, nchain, tau, aa, k, j, i, gs);
             const Real &ii = vo(b, GAI(nangles, gg, aa), k, j, i);
             const Real tmp = wght(aa) / (g1 + cdtsigt);
-            aa1 += tmp;
+            aa1 += (cdtsigt > 0.0) ? (1.0 - gs / cdtsigt) * tmp : tmp;
             aa2 += g1 * ii * tmp;
           }
           aa3 = 1.0 / (1.0 - aa1 * cdtsigs);
@@ -1135,15 +1362,36 @@ TaskStatus ApplyRHS(MeshData<Real> *rbase, MeshData<Real> *rout, MeshData<Real> 
             // Set advanced stage specific intensity
             const Real ee = Emissivity(gg, tadv, fbnd, ngroups, unit_utils);
             const Real jj = (aa1 * ee + aa2) * aa3;
+            const Real sf =
+                (cdtsigt > 0.0) ? (cdtsigs * jj + cdtsiga * ee) / cdtsigt : 0.0;
+            vs(b, ccrad::source(gg), k, j, i) = sf;
+            const auto tau = FaceTaus(vb, coords, ndim, coupling, gg, b, k, j, i);
             for (int aa = 0; aa < nangles; ++aa) {
-              const Real g1 = G1Coef(vg, coords, cp, NDIR, ndim, wght, gflx, arcw, numn,
-                                     ivol, mcw, split_g1, gg, aa, b, k, j, i);
+              Real gs = 0.0;
+              const Real g1 = G1Coef(coords, cp, NDIR, ndim, wght, gflx, arcw, numn, indn,
+                                     ivol, mcw, split_g1, nchain, tau, aa, k, j, i, gs);
               Real &ii = vo(b, GAI(nangles, gg, aa), k, j, i);
               // clang-format off
               ii = std::max(ii + ((cdtsigs * jj +
                                    cdtsiga * ee -
-                                   cdtsigt * ii) / (g1 + cdtsigt)), 0.0);
+                                   cdtsigt * ii -
+                                   gs * sf) / (g1 + cdtsigt)), 0.0);
               // clang-format on
+            }
+          }
+        } else {
+          // No absorption, emission or scattering this iteration (root failed), so the
+          // cell's own source function enters the face fluxes at its current value (as
+          // in JacobiFeedback)
+          for (int gg = 0; gg < ngroups; ++gg) {
+            const Real &sf = vs(b, ccrad::source(gg), k, j, i);
+            const auto tau = FaceTaus(vb, coords, ndim, coupling, gg, b, k, j, i);
+            for (int aa = 0; aa < nangles; ++aa) {
+              Real gs = 0.0;
+              const Real g1 = G1Coef(coords, cp, NDIR, ndim, wght, gflx, arcw, numn, indn,
+                                     ivol, mcw, split_g1, nchain, tau, aa, k, j, i, gs);
+              Real &ii = vo(b, GAI(nangles, gg, aa), k, j, i);
+              ii = std::max(ii - gs * sf / g1, 0.0);
             }
           }
         }
@@ -1162,6 +1410,8 @@ TaskStatus JacobiFeedback(MeshData<Real> *rbase, MeshData<Real> *riter,
   auto jacobi_pkg = pm->packages.Get(pkg_name);
   if (!(jacobi_pkg->Param<bool>("affect_fluid"))) return TaskStatus::complete;
   const bool split_g1 = jacobi_pkg->Param<bool>("split_g1");
+  const int nchain = jacobi_pkg->Param<int>("chain_length");
+  const bool coupling = jacobi_pkg->Param<bool>("coupling");
 
   // Indexing
   const int ndim = pm->ndim;
@@ -1187,14 +1437,17 @@ TaskStatus JacobiFeedback(MeshData<Real> *rbase, MeshData<Real> *riter,
   namespace ccbulk = cell_variables::cell_averaged::bulk;
   namespace ccr = cell_variables::cell_averaged::rad;
   auto &resolved_pkgs = pm->resolved_packages;
-  static auto desc_g = MakePackDescriptor<ccr::tauw>(resolved_pkgs.get());
+  static auto desc_g = MakePackDescriptor<ccr::aa, ccr::ss>(resolved_pkgs.get());
   static auto desc_i = MakePackDescriptor<ccr::intensity>(resolved_pkgs.get());
+  static auto desc_s = MakePackDescriptor<ccr::source>(resolved_pkgs.get());
   static auto desc_u = MakePackDescriptor<ccbulk::internal_energy>(resolved_pkgs.get());
   auto vu = desc_u.GetPack(ubase);
   auto vg = desc_g.GetPack(rbase);
   auto vb = desc_i.GetPack(rbase);
   auto vi = desc_i.GetPack(riter);
   auto vo = desc_i.GetPack(rout);
+  auto vs = desc_s.GetPack(riter);
+  auto vso = desc_s.GetPack(rout);
 
   // Angular flux indexing
   const auto NDIR = AngularFluxDirs();
@@ -1214,6 +1467,7 @@ TaskStatus JacobiFeedback(MeshData<Real> *rbase, MeshData<Real> *riter,
         for (int gg = 0; gg < ngroups; ++gg) {
           Real er_old = 0.0;
           Real er_new = 0.0;
+          const auto tau = FaceTaus(vg, coords, ndim, coupling, gg, b, k, j, i);
           for (int aa = 0; aa < nangles; ++aa) {
             // Collapsed indexing
             const int n = GAI(nangles, gg, aa);
@@ -1222,12 +1476,12 @@ TaskStatus JacobiFeedback(MeshData<Real> *rbase, MeshData<Real> *riter,
             // clang-format off
             Real g1p = 1.0, g1pp = 0.0;
             std::array<Real, 6> gn = {0.0};
-            GCoef<X1DIR>(vg, coords, cp, NDIR, ivol, split_g1, gg, aa,
-                         b, k, j, i, g1p, g1pp, gn[0], gn[1]);
-            if (multid) GCoef<X2DIR>(vg, coords, cp, NDIR, ivol, split_g1, gg, aa,
-                                     b, k, j, i, g1p, g1pp, gn[2], gn[3]);
-            if (threed) GCoef<X3DIR>(vg, coords, cp, NDIR, ivol, split_g1, gg, aa,
-                                     b, k, j, i, g1p, g1pp, gn[4], gn[5]);
+            GCoef<X1DIR>(coords, cp, NDIR, ivol, split_g1,
+                         tau, aa, k, j, i, g1p, g1pp, gn[0], gn[1]);
+            if (multid) GCoef<X2DIR>(coords, cp, NDIR, ivol, split_g1,
+                                     tau, aa, k, j, i, g1p, g1pp, gn[2], gn[3]);
+            if (threed) GCoef<X3DIR>(coords, cp, NDIR, ivol, split_g1,
+                                     tau, aa, k, j, i, g1p, g1pp, gn[4], gn[5]);
             // clang-format on
 
             // Backtrack contributions from g2-g7 and gn
@@ -1238,20 +1492,39 @@ TaskStatus JacobiFeedback(MeshData<Real> *rbase, MeshData<Real> *riter,
             df += threed * (gn[4] * vi(b, n, k - threed, j, i) +
                             gn[5] * vi(b, n, k + threed, j, i));
 
+            // Source function part of the face flux: lagged neighbors (identical to
+            // JacobiUpdate) and the cell's own (advanced) source function from ApplyRHS,
+            // whose coefficient gs includes the angular edges below
+            // clang-format off
+            Real gs = 0.0;
+            df += SourceFlux<X1DIR>(vs, coords, cp, NDIR, ivol,
+                                    tau, aa, b, gg, k, j, i, gs);
+            if (multid) df += SourceFlux<X2DIR>(vs, coords, cp, NDIR, ivol,
+                                                tau, aa, b, gg, k, j, i, gs);
+            if (threed) df += SourceFlux<X3DIR>(vs, coords, cp, NDIR, ivol,
+                                                tau, aa, b, gg, k, j, i, gs);
+            // clang-format on
+
             [[maybe_unused]] auto &wght_ = wght;
             [[maybe_unused]] auto &numn_ = numn;
             [[maybe_unused]] auto &gflx_ = gflx;
             [[maybe_unused]] auto &arcw_ = arcw;
             [[maybe_unused]] auto &indn_ = indn;
+            [[maybe_unused]] auto &nchain_ = nchain;
             if constexpr (do_angular_fluxes) {
               const Real mcw_ix1 =
                   -cdt * InverseRadiusForAngularFlux(coords, i) / wght_(aa);
+              const auto [blo, bhi] = ChainWeights(cp, NDIR, wght_, nchain_, tau, aa);
               for (int nb = 0; nb < numn_(aa); ++nb) {
                 const Real na = mcw_ix1 * gflx_(aa, nb) * arcw_(aa, nb);
-                g1p += (na > 0) * na;
-                df += (na < 0) * na * vi(b, GAI(nangles, gg, indn_(aa, nb)), k, j, i);
+                const Real ab = AngularWeight(indn_, aa, nb, blo, bhi);
+                g1p += (na > 0) * ab * na;
+                df +=
+                    (na < 0) * ab * na * vi(b, GAI(nangles, gg, indn_(aa, nb)), k, j, i);
+                gs += (1.0 - ab) * na;
               }
             }
+            df += gs * vso(b, ccr::source(gg), k, j, i);
 
             // Compute change in moments from coupling term
             // ...Jiang 21, Equation (22)...

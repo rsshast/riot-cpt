@@ -118,31 +118,21 @@ inline bool AddCouplingParams(ParameterInput *pin, Params &params) {
 
 //----------------------------------------------------------------------------------------
 //! \fn void AddCouplingUtils
-//! \brief Build the Rusanov flux and temperature root-find utility structs (only
-//! populated when coupling is enabled) and store them.
+//! \brief Build the temperature root-find utility struct (only populated when coupling
+//! is enabled) and store it.
 inline void AddCouplingUtils(ParameterInput *pin, Params &params, const bool coupling) {
-  FluxUtils futils;
   RootUtils rutils;
   if (coupling) {
-    // Flux params
-    const Real beta_default = (do_angular_fluxes) ? 0.0 : 1.0;
-    futils.beta = pin->GetOrAddReal(
-        radiation_block, "beta", beta_default,
-        "Coefficient weighting the local optical depth for the Rusanov flux");
-    futils.taumax =
-        pin->GetOrAddReal(radiation_block, "taumax", std::numeric_limits<Real>::max(),
-                          "Optical depth max used in Rusanov flux");
-    PARTHENON_REQUIRE(futils.taumax > 0.0, "Tau max must be > 0!");
     // Root find params
-    rutils.tol = pin->GetOrAddReal(radiation_block, "troot_tol", 1.0e-8,
-                                   "Tolerance for non-linear temperature root find ");
+    rutils.tol = pin->GetOrAddReal(
+        radiation_block, "troot_tol", 1.0e-8,
+        "Relative temperature tolerance for non-linear temperature root find");
     rutils.titer = pin->GetOrAddInteger(
         radiation_block, "troot_max_iter", 25,
         "Maximum #iter permitted for non-linear temperature root find");
     PARTHENON_REQUIRE(rutils.tol > 0.0, "Temp rootfind tolerance must be > 0!");
     PARTHENON_REQUIRE(rutils.titer > 0, "Temp rootfind iterations must be > 0!");
   }
-  params.Add("flux_utils", futils);
   params.Add("root_utils", rutils);
 }
 
@@ -151,11 +141,15 @@ inline void AddCouplingUtils(ParameterInput *pin, Params &params, const bool cou
 //! \brief Construct the requested angular mesh (geodesic or latlon), store it and the
 //! "angular_mesh" selector, and return the number of angles.
 inline int AddAngularMesh(ParameterInput *pin, Params &params) {
+  const std::string default_amesh = do_angular_fluxes ? "latlon" : "geodesic";
   const std::string amesh =
-      pin->GetOrAddString(radiation_block, "angular_mesh", "geodesic",
+      pin->GetOrAddString(radiation_block, "angular_mesh", default_amesh,
                           "Choose which angular mesh to use for SN");
+  PARTHENON_REQUIRE(!do_angular_fluxes || amesh == "latlon",
+                    "Curvilinear coordinates require the latlon angular mesh");
   params.Add("angular_mesh", amesh);
   int nangles = 0;
+  int chain_length = 0;
   if (amesh == "geodesic") {
     const int nlevel = pin->GetOrAddInteger(
         radiation_block, "nlevel", 1,
@@ -184,10 +178,12 @@ inline int AddAngularMesh(ParameterInput *pin, Params &params) {
     std::shared_ptr<LatLonGrid> prlatlon = std::make_unique<LatLonGrid>(ntheta, nphi);
     params.Add("latlon_grid", prlatlon);
     nangles = prlatlon->nangles;
+    chain_length = prlatlon->chain_length;
   } else {
     PARTHENON_THROW("Invalid angular mesh choice!");
   }
   params.Add("nangles", nangles);
+  params.Add("chain_length", chain_length);
   return nangles;
 }
 

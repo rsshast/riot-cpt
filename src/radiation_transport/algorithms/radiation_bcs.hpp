@@ -98,10 +98,14 @@ inline void DriveBCImpl(std::shared_ptr<MeshBlockData<Real>> &mbd, bool coarse) 
   const int ngroups = rad_pkg->Param<int>("ngroups");
   const int nangles = rad_pkg->Param<int>("nangles");
 
-  // Intensity
+  // Intensity and source function
   static auto descr = GetBoundaryPackDescriptorMap<ccrad::intensity>(mbd);
   auto vr = descr[coarse].GetPack(mbd.get());
-  if (vr.GetMaxNumberOfVars() > 0) {
+  static auto descs = GetBoundaryPackDescriptorMap<ccrad::source>(mbd);
+  auto vs = descs[coarse].GetPack(mbd.get());
+  const bool has_intensity = vr.GetMaxNumberOfVars() > 0;
+  const bool has_source = vs.GetMaxNumberOfVars() > 0;
+  if (has_intensity || has_source) {
     const Real trad = rad_pkg->Param<Real>("drive_trad");
     const auto unit_utils = rad_pkg->Param<UnitUtils>("unit_utils");
     const auto fbnd = *(rad_pkg->MutableParam<ParArray1D<Real>>("fbnd_d"));
@@ -113,16 +117,21 @@ inline void DriveBCImpl(std::shared_ptr<MeshBlockData<Real>> &mbd, bool coarse) 
           for (int gg = 0; gg < ngroups; ++gg) {
             const Real ee =
                 (trad > 0) ? Emissivity(gg, trad, fbnd, ngroups, unit_utils) : 0.0;
-            for (int aa = 0; aa < nangles; ++aa) {
-              vr(0, ccrad::intensity(GAI(nangles, gg, aa)), k, j, i) =
-                  std::max(ee, vr(0, ccrad::intensity(GAI(nangles, gg, aa)), kr, jr, ir));
+            if (has_intensity) {
+              for (int aa = 0; aa < nangles; ++aa) {
+                vr(0, ccrad::intensity(GAI(nangles, gg, aa)), k, j, i) =
+                    std::max(ee, vr(0, ccrad::intensity(GAI(nangles, gg, aa)), kr, jr, ir));
+              }
+            }
+            if (has_source) {
+              vs(0, ccrad::source(gg), k, j, i) =
+                  std::max(ee, vs(0, ccrad::source(gg), kr, jr, ir));
             }
           }
         });
   }
 
-  // Opacity: by default zero at the boundary to force a purely upwind flux (even when
-  // radiation_transport/beta > 0)
+  // Zero ghost opacity by default to enforce upwinding at the boundary.
   static auto desco = GetBoundaryPackDescriptorMap<ccrad::aa, ccrad::ss>(mbd);
   auto vo = desco[coarse].GetPack(mbd.get());
   if (vo.GetMaxNumberOfVars() > 0) {
@@ -168,20 +177,37 @@ inline void InnerSymmetry(std::shared_ptr<MeshBlockData<Real>> &mbd, bool coarse
   constexpr auto domain = axis ? IndexDomain::inner_x1 : IndexDomain::inner_x2;
   static auto descriptors = GetBoundaryPackDescriptorMap<rad::intensity>(mbd);
   auto v = descriptors[coarse].GetPack(mbd.get());
-  if (v.GetMaxNumberOfVars() == 0) return;
+  static auto opacity = GetBoundaryPackDescriptorMap<rad::aa, rad::ss>(mbd);
+  static auto source = GetBoundaryPackDescriptorMap<rad::source>(mbd);
+  auto vo = opacity[coarse].GetPack(mbd.get());
+  auto vs = source[coarse].GetPack(mbd.get());
+  const bool has_intensity = v.GetMaxNumberOfVars() > 0;
+  const bool has_opacity = vo.GetMaxNumberOfVars() > 0;
+  const bool has_source = vs.GetMaxNumberOfVars() > 0;
+  if (!has_intensity && !has_opacity && !has_source) return;
   pmb->par_for_bndry(
       "RZ-radiation-symmetry", IndexRange{0, 0}, domain,
       parthenon::TopologicalElement::CC, coarse, false,
       KOKKOS_LAMBDA(const int &, const int &k, const int &j, const int &i) {
         const int ir = axis ? 2 * start - 1 - i : i;
         const int jr = axis ? j : 2 * start - 1 - j;
-        for (int g = 0; g < ng; ++g)
-          for (int a = 0; a < na; ++a) {
-            const int partner = axis ? RZSymmetry::AxisAngle(a, np)
-                                     : RZSymmetry::EquatorAngle(a, nt, np);
-            v(0, rad::intensity(GAI(na, g, a)), k, j, i) =
-                v(0, rad::intensity(GAI(na, g, partner)), k, jr, ir);
+        for (int g = 0; g < ng; ++g) {
+          if (has_intensity) {
+            for (int a = 0; a < na; ++a) {
+              const int partner = axis ? RZSymmetry::AxisAngle(a, np)
+                                       : RZSymmetry::EquatorAngle(a, nt, np);
+              v(0, rad::intensity(GAI(na, g, a)), k, j, i) =
+                  v(0, rad::intensity(GAI(na, g, partner)), k, jr, ir);
+            }
           }
+          if (has_opacity) {
+            vo(0, rad::aa(g), k, j, i) = vo(0, rad::aa(g), k, jr, ir);
+            vo(0, rad::ss(g), k, j, i) = vo(0, rad::ss(g), k, jr, ir);
+          }
+          if (has_source) {
+            vs(0, rad::source(g), k, j, i) = vs(0, rad::source(g), k, jr, ir);
+          }
+        }
       });
 }
 } // namespace RZRadiationBoundary
